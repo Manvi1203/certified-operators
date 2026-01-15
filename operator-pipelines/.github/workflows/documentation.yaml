@@ -1,0 +1,30 @@
+---
+name: "Documentation"
+
+on:
+  push:
+    paths:
+      - docs/**
+      - mkdocs.yml
+  workflow_dispatch:
+
+jobs:
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Generate docs
+        run: |
+          pipx install mkdocs
+          pipx inject mkdocs \
+            mkdocs-material \
+            pymdown-extensions \
+            mkdocs-mermaid2-plugin
+
+          mkdocs build
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site

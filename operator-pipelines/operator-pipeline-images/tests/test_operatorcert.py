@@ -1,0 +1,255 @@
+from datetime import timezone
+from pathlib import Path
+from unittest import mock
+from unittest.mock import patch, MagicMock, call
+from typing import Dict
+
+import pytest
+import yaml
+from dateutil.parser import isoparse
+
+import operatorcert
+
+Bundle = Dict[str, Path]
+
+
+@pytest.fixture
+def bundle(tmp_path: Path) -> Bundle:
+    tmp_path.joinpath("metadata").mkdir()
+    annotations_path = tmp_path.joinpath("metadata", "annotations.yml")
+
+    annotations = {
+        "annotations": {
+            "operators.operatorframework.io.bundle.package.v1": "foo-operator",
+            "com.redhat.openshift.versions": "4.6-4.8",
+        }
+    }
+    with annotations_path.open("w") as fh:
+        yaml.safe_dump(annotations, fh)
+
+    tmp_path.joinpath("manifests").mkdir()
+    csv_path = tmp_path.joinpath("manifests", "foo-operator.clusterserviceversion.yml")
+
+    csv = {
+        "metadata": {
+            "annotations": {
+                "olm.properties": '[{"type": "olm.maxOpenShiftVersion", "value": "4.7"}]'
+            },
+        }
+    }
+    with csv_path.open("w") as fh:
+        yaml.safe_dump(csv, fh)
+
+    return {
+        "root": tmp_path,
+        "annotations": annotations_path,
+        "csv": csv_path,
+    }
+
+
+def test_get_bundle_annotations(bundle: Bundle) -> None:
+    bundle_root = bundle["root"]
+    assert operatorcert.get_bundle_annotations(bundle_root) == {
+        "operators.operatorframework.io.bundle.package.v1": "foo-operator",
+        "com.redhat.openshift.versions": "4.6-4.8",
+    }
+    bundle["annotations"].unlink()
+    with pytest.raises(RuntimeError):
+        operatorcert.get_bundle_annotations(bundle_root)
+
+
+@patch("operatorcert.pyxis.get")
+def test_get_supported_indices(mock_get: MagicMock) -> None:
+    mock_rsp = MagicMock()
+    mock_rsp.json.return_value = {"data": [{"foo": "bar"}]}
+    mock_get.return_value = mock_rsp
+
+    result = operatorcert.get_supported_indices(
+        "https://foo.bar", "4.6-4.8", "certified-operators"
+    )
+    assert result == [{"foo": "bar"}]
+
+
+@patch("operatorcert.datetime")
+@patch("operatorcert.get_supported_indices")
+def test_ocp_version_info(
+    mock_indices: MagicMock, mock_datetime: MagicMock, bundle: Bundle
+) -> None:
+    timestamp = "2022-01-01T00:00:00.000000+00:00"
+    mock_datetime.now.return_value = isoparse(timestamp).astimezone(timezone.utc)
+    organization = "certified-operators"
+    bundle_root = bundle["root"]
+
+    supported_indices = [
+        {"ocp_version": "4.7", "path": "quay.io/foo:4.7"},
+        {"ocp_version": "4.6", "path": "quay.io/foo:4.6", "end_of_life": timestamp},
+    ]
+
+    all_indices = [
+        {"ocp_version": "4.8", "path": "quay.io/foo:4.8"},
+        {"ocp_version": "4.7", "path": "quay.io/foo:4.7"},
+    ]
+
+    # Happy path
+    mock_indices.side_effect = (supported_indices, all_indices)
+    info = operatorcert.ocp_version_info(bundle_root, "", organization)
+
+    assert info == {
+        "versions_annotation": "4.6-4.8",
+        "indices": supported_indices[:1],
+        "max_version_index": supported_indices[0],
+        "all_indices": all_indices,
+        "not_supported_indices": all_indices[:1],
+    }
+
+    # No bundle path
+    mock_indices.reset_mock()
+    mock_indices.side_effect = (all_indices,)
+    info = operatorcert.ocp_version_info(None, "", organization)
+
+    assert info == {
+        "versions_annotation": None,
+        "indices": all_indices,
+        "max_version_index": all_indices[0],
+        "all_indices": all_indices,
+        "not_supported_indices": [],
+    }
+
+    # No supported indices found
+    mock_indices.reset_mock()
+    mock_indices.side_effect = [[], []]
+    with pytest.raises(ValueError):
+        operatorcert.ocp_version_info(bundle_root, "", organization)
+
+    # Index EOL reached
+    mock_indices.return_value = [
+        {
+            "ocp_version": "4.7",
+            "path": "quay.io/foo:4.7",
+            "end_of_life": timestamp,
+        }
+    ]
+    with pytest.raises(ValueError) as err_info:
+        operatorcert.ocp_version_info(bundle_root, "", organization)
+
+    # Missing version range annotation
+    annotations = {
+        "annotations": {
+            "operators.operatorframework.io.bundle.package.v1": "foo-operator",
+        }
+    }
+    with bundle["annotations"].open("w") as fh:
+        yaml.safe_dump(annotations, fh)
+
+    with pytest.raises(ValueError) as err_info:
+        operatorcert.ocp_version_info(bundle_root, "", organization)
+    assert (
+        str(err_info.value) == "'com.redhat.openshift.versions' annotation not defined"
+    )
+
+    # Missing package name annotation
+    annotations["annotations"] = {"com.redhat.openshift.versions": "4.6-4.8"}
+    with bundle["annotations"].open("w") as fh:
+        yaml.safe_dump(annotations, fh)
+
+    with pytest.raises(ValueError) as err_info:
+        operatorcert.ocp_version_info(bundle_root, "", organization)
+    assert (
+        str(err_info.value)
+        == "'operators.operatorframework.io.bundle.package.v1' annotation not defined"
+    )
+
+
+def test_get_repo_and_org_from_github_url() -> None:
+    # test http and ssh
+    for url in [
+        "git@github.com:redhat-openshift-ecosystem/operator-pipelines.git",
+        "https://github.com/redhat-openshift-ecosystem/operator-pipelines.git",
+    ]:
+        org, repo = operatorcert.get_repo_and_org_from_github_url(url)
+        assert org == "redhat-openshift-ecosystem"
+        assert repo == "operator-pipelines"
+
+    # wrong schema
+    with pytest.raises(ValueError):
+        operatorcert.get_repo_and_org_from_github_url(
+            "github.com/redhat-openshift-ecosystem/operator-pipelines/something"
+        )
+
+    # wrong amount of url segments
+    with pytest.raises(ValueError):
+        operatorcert.get_repo_and_org_from_github_url(
+            "git@github.com:redhat-openshift-ecosystem/operator-pipelines/something.git"
+        )
+
+
+@pytest.mark.parametrize(
+    "pr_title, is_valid, name, version",
+    [
+        ("operator operator-test123 (1.0.1)", True, "operator-test123", "1.0.1"),
+        ("operator OPERATOR (1.0.1-ok)", True, "OPERATOR", "1.0.1-ok"),
+        ("operator operator-test123 (1.0.1) aa", False, "", ""),
+        ("operator  (1.0.1)", False, "", ""),
+        ("operator-test123 (1.0.1)", False, "", ""),
+        ("operator-test123 (1.0.1)", False, "", ""),
+        ("operator oper@tor-test123 (1.0.1)", False, "", ""),
+        ("operator operator-test123 (1)", True, "operator-test123", "1"),
+    ],
+)
+def test_parse_pr_title(pr_title: str, is_valid: bool, name: str, version: str) -> None:
+    if is_valid:
+        res_name, res_version = operatorcert.parse_pr_title(pr_title)
+        assert res_name == name
+        assert res_version == version
+    else:
+        with pytest.raises(ValueError):
+            operatorcert.parse_pr_title(pr_title)
+
+
+@patch("operatorcert.pyxis.get")
+def test_download_test_results(mock_get: MagicMock) -> None:
+    # Arrange
+    args = MagicMock()
+    args.pyxis_url = "https://pyxis.engineering.redhat.com"
+    args.cert_project_id = "123456"
+    args.certification_hash = "123456abc"
+    args.operator_name = "foo"
+    args.operator_package_version = "12345"
+    args.cert_path = "/non/existing/path.crt"
+    args.key_path = "/non/existing/path.key"
+    test_results_url = (
+        "https://pyxis.engineering.redhat.com/v1/projects/certification/id/123456/test-results?filter"
+        "=certification_hash=='123456abc';version=='12345';operator_package_name=='foo'&sort_by"
+        "=creation_date[desc]&page_size=1"
+    )
+
+    mock_rsp = MagicMock()
+    mock_open = mock.mock_open()
+
+    # No resource got
+    mock_rsp.json.return_value = {"data": []}
+    mock_get.return_value = mock_rsp
+    # Act
+    result_id = operatorcert.download_test_results(args)
+    # Assert
+    assert result_id is None
+
+    # Happy path- there are resources (test results)
+    mock_rsp.json.return_value = {
+        "data": [
+            {
+                "_id": "1234",
+                "results": {"a": "ok"},
+                "passed": True,
+                "test_library": {},
+            }
+        ]
+    }
+    mock_get.return_value = mock_rsp
+    # Act
+    with mock.patch("builtins.open", mock_open):
+        result_id = operatorcert.download_test_results(args)
+    # Assert
+    assert result_id == "1234"
+    mock_get.assert_called_with(test_results_url)
+    mock_open.assert_called_with("test_results.json", "w", encoding="utf-8")

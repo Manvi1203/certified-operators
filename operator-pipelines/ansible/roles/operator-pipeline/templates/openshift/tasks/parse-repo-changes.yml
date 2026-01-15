@@ -1,0 +1,113 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: parse-repo-changes
+spec:
+  params:
+    - name: pipeline_image
+    - name: request_url
+      description: URL of the GitHub pull request we want to check
+      type: string
+    - name: github_token_secret_name
+      description: Name of the Kubernetes Secret that contains the GitHub token
+      default: github
+    - name: github_token_secret_key
+      description: Key within the Kubernetes Secret that contains the GitHub token
+      default: token
+  results:
+    - name: added_operator
+      description: Name of the operator that contains the new bundle
+    - name: added_bundle
+      description: Version of the new bundle
+    - name: operator_path
+      description: Path to the operator containing the new bundle
+    - name: bundle_path
+      description: Path to the new bundle
+    - name: affected_operators
+      description: Comma separated list of affected operators
+    - name: added_or_modified_bundles
+      description: Comma separated list of added or updated bundles
+    - name: affected_catalogs
+      description: Comma separated list of updated catalogs
+    - name: added_or_modified_catalogs
+      description: Comma separated list of added or updated catalogs
+    - name: catalogs_with_added_or_modified_operators
+      description: Comma separated list of catalogs with added or modified operator
+    - name: affected_catalog_operators
+      description: |
+        Comma separated list of operators added/updated/deleted inside
+        a catalogs directory structure
+    - name: added_or_modified_catalog_operators
+      description: |
+        Comma separated list of operators added or modified inside a catalogs
+        directory structure
+    - name: deleted_catalog_operators
+      description: |
+        Comma separated list of operators deleted from the catalogs
+        directory structure
+  workspaces:
+    - name: pr
+      description: Clone of the repo at the PR head
+    - name: base
+      description: Clone of the repo at head of the base branch
+    - name: output
+      description: A workspace for task output
+  steps:
+    - name: parse-repo-changes
+      image: "$(params.pipeline_image)"
+      workingDir: $(workspaces.output.path)
+      env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        detect-changed-operators \
+          --repo-path="$(workspaces.pr.path)" \
+          --base-repo-path="$(workspaces.base.path)" \
+          --pr-url="$(params.request_url)" \
+          --output-file changes.json \
+          --verbose
+
+        cat changes.json
+
+        operator_name="$(jq -r '.operator_name' < changes.json)"
+        echo -n $operator_name > "$(results.added_operator.path)"
+
+        bundle_version="$(jq -r '.bundle_version' < changes.json)"
+        echo -n $bundle_version > "$(results.added_bundle.path)"
+
+        operator_path="$(jq -r '.operator_path' < changes.json)"
+        echo -n $operator_path > "$(results.operator_path.path)"
+
+        bundle_path="$(jq -r '.bundle_path' < changes.json)"
+        echo -n $bundle_path > "$(results.bundle_path.path)"
+
+        affected_catalogs="$(jq -r '.affected_catalogs | join(",")' < changes.json)"
+        echo -n $affected_catalogs > "$(results.affected_catalogs.path)"
+
+        affected_operators="$(jq -r '.affected_operators | join(",")' < changes.json)"
+        echo -n $affected_operators > "$(results.affected_operators.path)"
+
+        added_or_modified_bundles="$(jq -r '.added_or_modified_bundles | join(",")' < changes.json)"
+        echo -n $added_or_modified_bundles > "$(results.added_or_modified_bundles.path)"
+
+        added_or_modified_catalogs="$(jq -r '.added_or_modified_catalogs | join(",")' < changes.json)"
+        echo -n $added_or_modified_catalogs > "$(results.added_or_modified_catalogs.path)"
+
+        catalogs_with_added_or_modified_operators="$(jq -r '.catalogs_with_added_or_modified_operators | join(",")' < changes.json)"
+        echo -n $catalogs_with_added_or_modified_operators > "$(results.catalogs_with_added_or_modified_operators.path)"
+
+        affected_catalog_operators="$(jq -r '.affected_catalog_operators | join(",")' < changes.json)"
+        echo -n $affected_catalog_operators > "$(results.affected_catalog_operators.path)"
+
+        added_or_modified_catalog_operators="$(jq -r '.added_or_modified_catalog_operators | join(",")' < changes.json)"
+        echo -n $added_or_modified_catalog_operators > "$(results.added_or_modified_catalog_operators.path)"
+
+        deleted_catalog_operators="$(jq -r '.deleted_catalog_operators | join(",")' < changes.json)"
+        echo -n $deleted_catalog_operators > "$(results.deleted_catalog_operators.path)"

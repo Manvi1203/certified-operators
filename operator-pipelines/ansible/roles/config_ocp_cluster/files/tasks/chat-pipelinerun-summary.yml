@@ -1,0 +1,104 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: chat-pipelinerun-summary
+spec:
+  description:
+    Send a PipelineRun summary message to Slack channel.
+
+  volumes:
+    - name: scratch
+      emptyDir: {}
+
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /mnt/scratch
+        name: scratch
+    workingDir: /mnt/scratch
+
+  params:
+    - name: namespace
+      description: The namespace of the PipelineRun.
+    - name: pipelinerun
+      description: The name of the PipelineRun to summarize.
+    - name: git_pr_url
+      description: The url of the related pull request.
+    - name: jq_image
+      description: Container image with jq installed
+      default: "quay.io/redhat-isv/operator-pipelines-images:released"
+    - name: ose_cli_image
+      description: OSE cli image
+      default: registry.redhat.io/openshift4/ose-cli
+    - name: slack_webhook_secret
+      description:
+        The name of the Kubernetes Secret that contains the Slack webhook.
+      default: slack
+    - name: slack_webhook_secret_key
+      description:
+        The key within the Kubernetes Secret that contains the Slack webhook.
+      default: slack_webhook
+
+  steps:
+    - name: build-message
+      image: "$(params.ose_cli_image)"
+      script: |
+        #!/usr/bin/env bash
+        set +x -e -o pipefail
+
+        ns="$(params.namespace)"
+        pr="$(params.pipelinerun)"
+        pr_url="$(params.git_pr_url)"
+        echo "PipelineRun: $pr" >> pipelinerun.txt
+        echo "Namespace: $ns" >> pipelinerun.txt
+        if [ -n "$pr_url" ]; then
+          echo "PR URL: $pr_url" >> pipelinerun.txt
+        fi
+
+        echo "Getting PipelineRun info"
+        status=$(oc get pipelinerun $pr -n $ns -o 'jsonpath={.status.conditions[-1].reason}')
+        status_msg=$(oc get pipelinerun $pr -n $ns -o 'jsonpath={.status.conditions[-1].message}')
+        echo "Status: *$status*" >> pipelinerun.txt
+        echo "Message: $status_msg" >> pipelinerun.txt
+
+        echo "Building console URL"
+        base_url=$(oc whoami --show-console)
+        path="/k8s/ns/$ns/tekton.dev~v1~PipelineRun/$pr/"
+        echo "Console: $base_url$path" >> pipelinerun.txt
+
+        echo "Getting TaskRun info"
+        echo '```' >> pipelinerun.txt
+        oc get taskrun -n $ns \
+          -l tekton.dev/pipelineRun=$pr \
+          -o "custom-columns=TASK:metadata.labels['tekton\.dev/pipelineTask'],STATUS:status.conditions[-1].reason" \
+          >> pipelinerun.txt
+        echo '```' >> pipelinerun.txt
+
+        cat pipelinerun.txt
+
+    - name: post-message-slack
+      env:
+        - name: WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: $(params.slack_webhook_secret)
+              key: $(params.slack_webhook_secret_key)
+      image: "$(params.jq_image)"
+      script: |
+        #! /usr/bin/env bash
+        set +x -e -o pipefail
+
+        jq -n --rawfile summary pipelinerun.txt '{"text": $summary}' > payload.json
+
+        status=$(cat payload.json | grep -oP "Status: (?=\*).\K.*(?=\*)")
+
+        # Skip notifications for operator-hosted-pipeline and passed pipelines
+        if cat payload.json | grep -oP "PipelineRun: operator-hosted-pipeline*" > /dev/null || [ "$status" != "Failed" ];
+        then
+          echo "Skipping Slack notification"
+        else
+            echo "Posting message to Slack"
+            curl -s -X POST -H "Content-Type: application/json" \
+              --data @payload.json \
+              "$WEBHOOK_URL"
+        fi

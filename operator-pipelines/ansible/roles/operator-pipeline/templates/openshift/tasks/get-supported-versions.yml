@@ -1,0 +1,99 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: get-supported-versions
+spec:
+  params:
+    - name: pipeline_image
+    - name: bundle_path
+      description: path indicating the location of the certified bundle within the repository
+  results:
+    - name: max_supported_ocp_version
+      description: Maximum version of OpenShift supported by this Operator
+
+    - name: max_supported_index
+      description: Pull spec for the index corresponding to the max OCP version
+
+    - name: indices
+      description: All known supported index image pull specs (space separated)
+
+    - name: indices_ocp_versions
+      description: All known supported OCP versions (space separated)
+
+    - name: skipped_ocp_versions
+      description: All known ocp index image pull specs not supported by the operator (space separated)
+
+    - name: skipped_ocp_indices
+      description: All known ocp version not supported by the operator (space separated)
+
+    - name: max_version_indices
+      description: Latest known supported OCP indices
+
+    - name: ocp_version
+      description: OCP version annotation of the bundle
+  workspaces:
+    - name: source
+  steps:
+    - name: supported-version-check
+      image: "$(params.pipeline_image)"
+      workingDir: $(workspaces.source.path)
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        ORGANIZATION=$(cat config.yaml | yq -r '.organization')
+        OCP_VERSIONS_OUTPUT_FILE="./ocp_versions.json"
+        if [ -n "$(params.bundle_path)" ] ; then
+            ocp-version-info \
+              --output-file $OCP_VERSIONS_OUTPUT_FILE \
+              --bundle-path "$(params.bundle_path)" \
+              $ORGANIZATION
+        else
+            ocp-version-info \
+              --output-file $OCP_VERSIONS_OUTPUT_FILE \
+              $ORGANIZATION
+        fi
+
+        VERSION_INFO=$(cat $OCP_VERSIONS_OUTPUT_FILE)
+        echo $VERSION_INFO | jq
+
+        echo $VERSION_INFO \
+          | jq -r '.max_version_index.ocp_version' \
+          | tr -d '\n\r' \
+          | tee $(results.max_supported_ocp_version.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.max_version_index.path' \
+          | tr -d '\n\r' \
+          | tee $(results.max_supported_index.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.indices | map(.path) | join(" ")' \
+          | tr -d '\n\r' \
+          | tee $(results.indices.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.indices | map(.ocp_version) | join(" ")' \
+          | tr -d '\n\r' \
+          | tee $(results.indices_ocp_versions.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.not_supported_indices | map(.path) | join(" ")' \
+          | tr -d '\n\r' \
+          | tee $(results.skipped_ocp_indices.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.not_supported_indices | map(.ocp_version) | join(" ")' \
+          | tr -d '\n\r' \
+          | tee $(results.skipped_ocp_versions.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.max_version_index.path' \
+          | tr -d '\n\r' \
+          | tee $(results.max_version_indices.path)
+
+        echo $VERSION_INFO \
+          | jq -r '.versions_annotation' \
+          | tr -d '\n\r' \
+          | tee $(results.ocp_version.path)

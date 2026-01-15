@@ -1,0 +1,49 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: set-quay-repo-visibility
+spec:
+  params:
+    - name: pipeline_image
+    - name: repository
+      description: Fill container repository path (e.g. <namespace>/<repo-name>)
+    - name: visibility
+      description: public or private
+    - name: oauth_secret_name
+      description: The name of a secret containing the OAuth2 token
+    - name: oauth_secret_key
+      description: The name of the key in the secret containing the OAuth2 token
+  steps:
+    - name: change-visibility
+      image: "$(params.pipeline_image)"
+      env:
+        - name: QUAY_OAUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.oauth_secret_name)
+              key: $(params.oauth_secret_key)
+      script: |
+        #! /usr/bin/env bash
+        # DO NOT use `set -x` to avoid exposing the OAuth token
+        set -e
+
+        response=$(curl -s -w "\n%{http_code}" -X POST \
+          -H "Authorization: Bearer $QUAY_OAUTH_TOKEN" \
+          -H "Content-Type:application/json" \
+          -d "{\"visibility\": \"$(params.visibility)\"}" \
+          "https://quay.io/api/v1/repository/$(params.repository)/changevisibility")
+
+        http_code=$(echo "$response" | tail -n1)
+        response_body=$(echo "$response" | head -n -1)
+
+        echo "Response body: $response_body"
+        echo "HTTP status code: $http_code"
+
+        # Account for 200 and 201, since quay's docs mention 201, but in testing 200 is returned
+        if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
+          echo "Error: Expected HTTP 2xx but got $http_code"
+          exit 1
+        fi
+
+        echo "Repository visibility successfully changed."

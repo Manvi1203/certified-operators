@@ -1,0 +1,34 @@
+---
+- name: Customize TektonConfig
+  tags:
+    - always
+  kubernetes.core.k8s:
+    state: present
+    validate_certs: "{{ k8s_validate_certs }}"
+    definition: "{{ lookup('file', '{{ item }}') }}"
+  with_items:
+    - ../files/tektonconfig.yml
+
+- name: Include pipelinerun listener task
+  tags:
+    - chat
+    - metrics
+  ansible.builtin.include_tasks: tasks/pipelinerun-listener.yml
+
+- name: Include Chat trigger
+  tags:
+    - chat
+  ansible.builtin.include_tasks: tasks/chat-trigger.yml
+  when: config_ocp_cluster_chat_enabled
+
+- name: Include Metrics trigger
+  tags:
+    - metrics
+  ansible.builtin.include_tasks: tasks/metrics-trigger.yml
+  when: config_ocp_cluster_metrics_enabled
+
+- name: Include Slack summary bot
+  tags:
+    - slack
+  ansible.builtin.include_tasks: tasks/support-summary.yml
+  when: config_ocp_cluster_summary_bot_enabled

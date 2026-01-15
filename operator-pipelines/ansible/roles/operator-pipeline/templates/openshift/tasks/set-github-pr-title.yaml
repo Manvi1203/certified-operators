@@ -1,0 +1,105 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: set-github-pr-title
+spec:
+  params:
+    - name: pipeline_image
+      description: The common pipeline image.
+
+    - name: pull_request_url
+      description: URL to Github pull request with a new bundle submission.
+
+    - name: operator_name
+      description: A name of the operator that is added in a PR
+
+    - name: bundle_version
+      description: A version of the operator bundle that is added in a PR
+
+    - name: affected_catalogs
+      description: Comma separated list of updated catalogs
+
+    - name: affected_catalog_operators
+      description: Comma separated list of operators inside all catalogs
+
+    - name: github_token_secret_name
+      description: The name of the Kubernetes Secret that contains the GitHub token.
+      default: github
+
+    - name: github_token_secret_key
+      description: The key within the Kubernetes Secret that contains the GitHub token.
+      default: token
+  steps:
+    - name: set-github-status
+      image: "$(params.pipeline_image)"
+      env:
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      script: |
+        #! /usr/bin/env bash
+        set -ex
+
+        TITLE=""
+
+        echo "Setting the PR title"
+        if [[ "$(params.bundle_version)" != "" ]] && [[ "$(params.affected_catalogs)" != "" ]]; then
+          # Update both operator and catalog
+          TITLE="operator $(params.operator_name) ($(params.bundle_version)) | [$(params.affected_catalogs)]"
+
+        elif [[ "$(params.bundle_version)" != "" ]]; then
+          # Update of operator bundle only
+          TITLE="operator $(params.operator_name) ($(params.bundle_version))"
+
+        elif [[ "$(params.affected_catalogs)" != "" ]]; then
+          # Update of catalogs only, can get quite long
+
+          # Limit that is shown by GH API
+          MAX_TITLE_LEN=256
+
+          TITLE_BEGINNING="Catalog update ["
+          TITLE_ENDING="] [$(params.affected_catalogs)]"
+
+          # Catalog Operators are in the following format:
+          # catalogVersion1/operator1,catalogVersion2/operator1,...
+          # We need to trim Catalog version from all operators in 5 steps:
+          # Step 1: split operators
+          IFS=',' read -ra RAW_OPERATOR_ARR <<< "$(params.affected_catalog_operators)"
+          unset IFS
+          OPERATOR_ARR=()
+
+          # Step 2: Remove everything before the first '/' in each operator
+          for OPERATOR in "${RAW_OPERATOR_ARR[@]}"; do
+            OPERATOR_ARR+=("${OPERATOR#*/}")
+          done
+
+          # Step 3: dedup the array
+          IFS=' ' read -ra OPERATOR_ARR <<< "$(echo "${OPERATOR_ARR[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+          unset IFS
+
+          # Step 4: Join operator names back
+          TITLE_MIDDLE=$(printf ",%s" "${OPERATOR_ARR[@]}")
+
+          # Step 5: Remove the heading ','
+          TITLE_MIDDLE="${TITLE_MIDDLE:1}"
+
+          FREE_CAPACITY=$(( "${MAX_TITLE_LEN}" - $(echo "${TITLE_BEGINNING}" | wc -m) - $( echo "${TITLE_ENDING}" | wc -m) ))
+
+          # Shorten the middle part if it is too long
+          if [[ $(echo "${TITLE_MIDDLE}" | wc -m) -gt "${FREE_CAPACITY}" ]]; then
+            CUT_TO_LENGTH=$(( "${FREE_CAPACITY}" - 3 ))
+            TITLE_MIDDLE="${TITLE_MIDDLE::${CUT_TO_LENGTH}}..."
+          fi
+          TITLE="${TITLE_BEGINNING}${TITLE_MIDDLE}${TITLE_ENDING}"
+
+        else
+          echo "No bundles nor catalogs have been added/updated"
+          exit 0
+        fi
+
+        echo $TITLE
+
+        gh pr edit --title "$TITLE" "$(params.pull_request_url)"

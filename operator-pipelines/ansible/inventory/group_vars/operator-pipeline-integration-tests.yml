@@ -1,0 +1,65 @@
+---
+env: integration-tests
+ocp_host: https://api.pipelines-stage.0ce8.p1.openshiftapps.com:6443
+
+operator_pipeline_pending_namespace: operator-pipeline-stage
+operator_pipeline_release_namespace: redhat-isv-operators-stage
+community_operator_pipeline_pending_namespace: "community-operator-pipeline-stage"
+
+# Settings for importing index imagestreams
+insecure_index_import: true
+certified_operator_index: registry.stage.redhat.io/redhat/certified-operator-index
+redhat_marketplace_index: registry.stage.redhat.io/redhat/redhat-marketplace-index
+
+# CI pipeline secrets
+ci_pipeline_github_ssh_credentials_path: ../../vaults/{{ env }}/ci-pipeline-github-ssh-key
+ci_pipeline_kubeconfig_path: ../../vaults/{{ env }}/ci-pipeline-kubeconfig
+
+# Webhook vars
+operator_pipeline_github_webhook_repos:
+  - redhat-openshift-ecosystem/operator-pipelines-test
+
+# Test data configuration
+integration_tests_src_operator_git_branch: e2e-test-operator
+integration_tests_src_operator_package_name: test-e2e-operator
+integration_tests_src_operator_bundle_version: 0.0.8
+
+# This version needs to be alligned with the cluster version in order
+# to pass integration tests
+integration_tests_ocp_versions_range: "=v4.18"
+
+integration_tests_fbc_catalog: false
+integration_tests_verify_bundle_in_catalog: true
+
+integration_tests_pr_title: "operator {{ integration_tests_operator_package_name }} ({{ integration_tests_operator_bundle_version }})"
+
+integration_tests_git_upstream_repo: redhat-openshift-ecosystem/operator-pipelines-test
+integration_tests_git_repo_url: "git@github.com:{{ integration_tests_git_upstream_repo }}.git"
+
+# A branch name for event listener to listen to
+branch: "{{ integration_tests_git_upstream_branch }}"
+
+operator_pipeline_dispatcher_config:
+  - name: Hosted pipeline for certified operators
+    events: "{{ operator_pipeline_dispatcher_hosted_pipeline_events }}"
+    full_repository_name: "{{ integration_tests_git_upstream_repo }}"
+    capacity:
+      type: ocp_tekton
+      pipeline_name: "operator-hosted-pipeline"
+      max_capacity: "{{ operator_pipeline_dispatcher_hosted_capacity }}"
+      namespace: "{{ oc_namespace }}"
+    callback_url: "{{ operator_pipeline_callback_url }}"
+    filter:
+      cel_expression: "{{ operator_pipeline_hosted_pipeline_cel_filter | replace('\n', '') }}"
+
+  - name: Release pipeline for certified operators
+    events: "{{ operator_pipeline_dispatcher_release_pipeline_events }}"
+    full_repository_name: "{{ integration_tests_git_upstream_repo }}"
+    capacity:
+      type: ocp_tekton
+      pipeline_name: "operator-release-pipeline"
+      max_capacity: "{{ operator_pipeline_dispatcher_release_capacity }}"
+      namespace: "{{ oc_namespace }}"
+    callback_url: "{{ operator_pipeline_callback_url }}"
+    filter:
+      cel_expression: "{{ operator_pipeline_release_pipeline_cel_filter | replace('\n', '') }}"

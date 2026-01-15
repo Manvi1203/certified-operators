@@ -1,0 +1,81 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: index-signing-image-check
+spec:
+  description: |
+    A task to check whether bootstrapped index image can be signed.
+    Only images that haven't been published as GA can be signed.
+  params:
+    - name: pipeline_image
+      description: A docker image of operator-pipeline-images for the steps to run in.
+    - name: image_pullspec
+      description: A index image pullspec to check
+    - name: registry_auth_secret_name
+      default: "index-img-signing-pipeline-registry-auth"
+    - name: pyxis_env
+      description: Environment to run in. Can be one of [dev, qa, stage, prod]
+      default: prod
+
+  volumes:
+    - name: registry-auth
+      secret:
+        secretName: "$(params.registry_auth_secret_name)"
+  workspaces:
+    - name: results
+
+  steps:
+    - name: check-allowed-index-image
+      image: "$(params.pipeline_image)"
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        # strip the ':tag' from the image pullspec
+        IMAGE_PULLSPEC=$(echo "$(params.image_pullspec)" | cut -d':' -f1)
+
+        # Remove the '.stage' substring if exists
+        IMAGE_PULLSPEC=$(echo "$IMAGE_PULLSPEC" | sed 's/\.stage//g')
+
+        if ! [[ "$IMAGE_PULLSPEC" == "registry.redhat.io/redhat/certified-operator-index" ||
+                "$IMAGE_PULLSPEC" == "registry.redhat.io/redhat/redhat-marketplace-index" ||
+                "$IMAGE_PULLSPEC" == "registry.redhat.io/redhat/community-operator-index" ]]; then
+          echo "The image $(params.image_pullspec) is not valid for index signing."
+          exit 1
+        fi
+    - name: check-image-in-pyxis
+      image: "$(params.pipeline_image)"
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        PYXIS_ENV=$(params.pyxis_env)
+        PYXIS_BASE_URL="https://catalog.redhat.com/api/containers"
+        if [ "$PYXIS_ENV" != "prod" ]; then
+          PYXIS_BASE_URL="https://catalog.stage.redhat.com/api/containers"
+        fi
+
+        FULL_PYXIS_URL="$PYXIS_BASE_URL/v1/operators/indices?filter=path==$(params.image_pullspec)"
+
+        # Use squid proxy to access non prod environments
+        curl -x http://squid.corp.redhat.com:3128 -s -X GET $FULL_PYXIS_URL > /tmp/pyxis_response.json
+        jq . /tmp/pyxis_response.json
+
+        export ITEMS=$(jq -r ".data | length" /tmp/pyxis_response.json)
+        if [ $ITEMS -gt 0 ]; then
+          echo "Image $(params.image_pullspec) is found in Pyxis. The version is already GA. Signing is not allowed."
+          exit 1
+        fi
+
+        echo "Image $(params.image_pullspec) is not found in Pyxis. Signing is allowed."
+
+    - name: signing-input
+      image: "$(params.pipeline_image)"
+      workingDir: $(workspaces.results.path)
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        # Write the image pullspec to a file to be compatible with the signing task
+        echo -n "$(params.image_pullspec)+$(params.image_pullspec)" > "./index-image-paths.txt"

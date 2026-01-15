@@ -1,0 +1,61 @@
+---
+- name: "Verify success of running {{ pipeline_name }}"
+  tags:
+    - verify-pipeline
+  block:
+    - name: Find the run of {{ pipeline_name }} #
+      kubernetes.core.k8s_info:
+        api_version: tekton.dev/v1
+        kind: PipelineRun
+        namespace: "{{ oc_namespace }}"
+        label_selectors:
+          - "tekton.dev/pipeline={{ pipeline_name }}"
+          - "suffix={{ suffix }}"
+      register: integration_tests_pipeline_run
+      until: integration_tests_pipeline_run.resources | length > 0
+      retries: 10
+      delay: 5
+      failed_when: integration_tests_pipeline_run.resources | length == 0
+
+    - name: Pipelinerun
+      ansible.builtin.debug:
+        var: integration_tests_pipeline_run.resources[0].metadata.name
+
+    - name: "Wait for the run of {{ pipeline_name }}"
+      kubernetes.core.k8s_info:
+        api_version: tekton.dev/v1
+        kind: PipelineRun
+        namespace: "{{ oc_namespace }}"
+        name: "{{ integration_tests_pipeline_run.resources[0].metadata.name }}"
+      register: integration_tests_pipeline_run_wait
+      until: >
+        integration_tests_pipeline_run_wait.resources[0] | community.general.json_query("contains(['False', 'True'], status.conditions[?type == 'Succeeded']|[-1].status)")
+      retries: 90
+      delay: 60
+
+    - name: "Get pipelinerun logs - {{ pipeline_name }}"
+      ansible.builtin.shell: |
+        ./tkn pipeline logs \
+          {{ pipeline_name }} \
+          {{ integration_tests_pipeline_run.resources[0].metadata.name }} \
+          --namespace {{ oc_namespace }}
+      args:
+        executable: /bin/bash
+        chdir: "{{ integration_tests_temp_tools_dir.path }}"
+      no_log: true
+      register: integration_tests_pipeline_run_logs
+      changed_when: false
+
+    - name: "Print pipelinerun logs - {{ pipeline_name }}"
+      ansible.builtin.debug:
+        var: integration_tests_pipeline_run_logs.stdout_lines
+
+    - name: Verify successful run of {{ pipeline_name }}
+      kubernetes.core.k8s_info:
+        api_version: tekton.dev/v1
+        kind: PipelineRun
+        namespace: "{{ oc_namespace }}"
+        name: "{{ integration_tests_pipeline_run.resources[0].metadata.name }}"
+      register: integration_tests_pipeline_run
+      failed_when: >
+        integration_tests_pipeline_run.resources[0].status.conditions[-1].status != "True"

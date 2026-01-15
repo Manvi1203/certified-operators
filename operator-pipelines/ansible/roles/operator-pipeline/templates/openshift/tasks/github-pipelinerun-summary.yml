@@ -1,0 +1,206 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: github-pipelinerun-summary
+spec:
+  description: >-
+    This task adds a PipelineRun summary comment to a GitHub pull request.
+  workspaces:
+    - name: base
+    - name: output
+      description: Scratch space and storage for the comment
+
+  params:
+    - name: pipelines_cli_tkn_image
+      description: Teknton cli image
+      default: "registry.redhat.io/openshift-pipelines/pipelines-cli-tkn-rhel8@sha256:d966a46ceac30b702791be4c1278ae316896119521d3007da8a6f2303671d577"
+    - name: github_host_url
+      description: |
+        The GitHub host, adjust this if you run a GitHub enteprise.
+      default: "https://api.github.com"
+
+    - name: request_url
+      description: |
+        The GitHub issue or pull request URL where we want to add a new
+        comment.
+
+    - name: github_token_secret_name
+      description: |
+        The name of the Kubernetes Secret that contains the GitHub token.
+      default: github
+
+    - name: github_token_secret_key
+      description: |
+        The key within the Kubernetes Secret that contains the GitHub token.
+      default: token
+
+    - name: pipelinerun
+      description: The name of the PipelineRun to summarize.
+
+    - name: pipeline_name
+      description: The name of the Pipeline.
+
+    - name: pipeline_status
+      description: The result status of the Pipeline.
+
+    - name: pipeline_image
+      description: The common pipeline image.
+
+    - name: upload_pipeline_logs
+      default: "false"
+      description: |
+        A flag that determines whether pipeline logs should be uploaded to Github gists
+      type: string
+
+  steps:
+    - name: gather-info
+      workingDir: $(workspaces.output.path)
+      image: "$(params.pipelines_cli_tkn_image)"
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        PR_NAME="$(params.pipelinerun)"
+        mkdir $PR_NAME
+
+        echo "Getting pipeline logs"
+        tkn pipelinerun logs "$(params.pipelinerun)" > $PR_NAME/$(params.pipelinerun).log
+
+        echo "Getting PipelineRun details"
+        tkn pipelinerun describe $PR_NAME -o json > $PR_NAME/pipelinerun.json
+
+        echo "Getting TaskRun details"
+        tkn taskrun list \
+          --label 'tekton.dev/pipelineRun'=="$PR_NAME" \
+          -o jsonpath='{.items}' \
+          > $PR_NAME/taskruns.json
+
+        chmod -R 777 $PR_NAME
+
+    - name: upload-pipeline-logs
+      workingDir: $(workspaces.output.path)
+      image: "$(params.pipeline_image)"
+      env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      script: |
+        #! /usr/bin/env bash
+        set -ex
+
+        if [[ "$(params.upload_pipeline_logs)" == "true" ]]; then
+          echo "Uploading pipeline logs"
+
+          PR_NAME="$(params.pipelinerun)"
+          create-github-gist \
+            --output-file "$PR_NAME/gits_output.json" \
+            "$PR_NAME/$(params.pipelinerun).log"
+
+          echo "Logs have been successfully uploaded"
+        fi
+
+    - name: build-comment
+      workingDir: $(workspaces.output.path)
+      image: "$(params.pipeline_image)"
+      env:
+        - name: WORKSPACE_BASE_PATH
+          value: $(workspaces.base.path)
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        PR_NAME="$(params.pipelinerun)"
+
+        pipelinerun-summary $PR_NAME/pipelinerun.json $PR_NAME/taskruns.json \
+          > $PR_NAME/comment.md
+
+        if [[ "$(params.upload_pipeline_logs)" == "true" ]]; then
+          cat $PR_NAME/gits_output.json
+          GIST_URL=`cat $PR_NAME/gits_output.json | jq -r ".gist_url"`
+          echo "Pipeline logs: $GIST_URL" >> $PR_NAME/comment.md
+        fi
+
+        CONFIG_PATH="$WORKSPACE_BASE_PATH/config.yaml"
+        ORGANIZATION=`cat $CONFIG_PATH | yq -r '.organization'`
+
+        if [[ "$ORGANIZATION" == "community-operators" ]]
+        then
+          DOC_LINK="https://redhat-openshift-ecosystem.github.io/operator-pipelines/users/community-operators-troubleshooting/"
+        else
+          DOC_LINK="https://github.com/redhat-openshift-ecosystem/certification-releases/blob/main/4.9/ga/troubleshooting.md"
+        fi
+
+        # Load info about fbc_enablement from file
+        if [[ -f "$(workspaces.output.path)/fbc_enabled" ]]; then
+          fbc_enabled=$(cat "$(workspaces.output.path)/fbc_enabled")
+        else
+          fbc_enabled="false"
+        fi
+
+        if [[ "$(params.pipeline_name)" == "operator-release-pipeline" && ("$(params.pipeline_status)" == "Succeeded" || "$(params.pipeline_status)" == "Completed") ]]; then
+          # Add details about released bundle and indices
+          echo -e "\n## Release info\n" >> "$PR_NAME/comment.md"
+          RELEASE_INFO_DIR_PATH="$(workspaces.output.path)/release_info"
+          if [[ -d "$RELEASE_INFO_DIR_PATH" ]]; then
+            if [[ -f "$RELEASE_INFO_DIR_PATH/released_bundle.txt" ]]; then
+              echo -e "\n*Released bundle:* \n" >> "$PR_NAME/comment.md"
+              cat "$RELEASE_INFO_DIR_PATH/released_bundle.txt" >> "$PR_NAME/comment.md"
+            fi
+            if [[ -f "$RELEASE_INFO_DIR_PATH/updated_indices.txt" ]]; then
+              echo -e "\n*Updated indices:* \n" >> "$PR_NAME/comment.md"
+              cat "$RELEASE_INFO_DIR_PATH/updated_indices.txt" >> "$PR_NAME/comment.md"
+            fi
+          else
+            echo -e "\nNothing was released.\n" >> "$PR_NAME/comment.md"
+          fi
+
+          # Add info how to update catalog for FBC bundles
+          if [[ "$fbc_enabled" == "true" && -f "$RELEASE_INFO_DIR_PATH/released_bundle.txt" ]]; then
+            echo -e "\n## Catalog update\n" >> "$PR_NAME/comment.md"
+            if [[ -f "$RELEASE_INFO_DIR_PATH/fbc_pr_url.txt" ]]; then
+              PR_URL=$(cat "$RELEASE_INFO_DIR_PATH/fbc_pr_url.txt")
+
+              cat >> "$PR_NAME/comment.md" <<EOF
+        Automated release to the File-Based Catalog has been enabled for this bundle
+
+        A new pull request has been created to update the catalog with the new bundle. You can find the PR here: $PR_URL.
+        EOF
+
+            else
+              echo -e "Operator bundle using FBC mode has been released.\nTo add bundle to FBC templates, follow [this guide](https://redhat-openshift-ecosystem.github.io/operator-pipelines/users/fbc_workflow/#adding-new-bundle-to-catalog) to create a new PR with catalog changes." >> "$PR_NAME/comment.md"
+            fi
+          fi
+        fi
+
+
+        if [[ -f "$(workspaces.output.path)/merge_error.txt" ]]; then
+          MERGE_ERROR=$(cat "$(workspaces.output.path)/merge_error.txt")
+          echo -e "\n## ❌ Not merged\n" >> $PR_NAME/comment.md
+          echo -e "PR cannot be merged for the following reasons: \`$MERGE_ERROR\`" >> $PR_NAME/comment.md
+        fi
+
+        echo -e "\n## Troubleshooting\n\nPlease refer to the [troubleshooting guide]($DOC_LINK)." >> $PR_NAME/comment.md
+        echo -e "\nRun \`/pipeline restart $(params.pipeline_name)\` in case of pipeline failure to restart a pipeline." >> $PR_NAME/comment.md
+
+    - name: post-comment
+      workingDir: $(workspaces.output.path)
+      env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      image: "$(params.pipeline_image)"
+      script: |
+        #! /usr/bin/env bash
+        set -xe -o pipefail
+
+        echo "Posting GitHub comment to issue (or PR) $(params.request_url)"
+
+        github-add-comment \
+          --github-host-url "$(params.github_host_url)" \
+          --request-url "$(params.request_url)" \
+          --comment-file "$(params.pipelinerun)/comment.md"

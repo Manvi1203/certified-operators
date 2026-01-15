@@ -1,0 +1,166 @@
+---
+- name: Create trigger enabling running Community hosted pipeline via Github webhook
+  tags:
+    - triggers
+  block:
+    - name: Create Community hosted pipeline Trigger Binding
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ oc_namespace }}"
+        definition:
+          apiVersion: triggers.tekton.dev/v1alpha1
+          kind: TriggerBinding
+          metadata:
+            name: community-operator-hosted-pipeline-trigger-binding
+            labels:
+              app: operator-pipeline
+              suffix: "{{ suffix }}"
+              env: "{{ env }}"
+          spec:
+            params:
+              - name: git_pr_url
+                value: $(body.pull_request.html_url)
+              - name: git_fork_url
+                value: $(body.pull_request.head.repo.ssh_url)
+              - name: git_repo_url
+                value: $(body.pull_request.base.repo.ssh_url)
+              - name: git_base_branch
+                value: $(body.pull_request.base.ref)
+              - name: git_username
+                value: $(body.pull_request.user.login)
+              - name: git_commit
+                value: $(body.pull_request.head.sha)
+              - name: git_commit_base
+                value: $(body.pull_request.base.sha)
+              - name: env
+                value: "{{ env }}"
+              - name: preflight_trigger_environment
+                value: "{{ preflight_trigger_environment }}"
+              - name: image_namespace
+                value: "{{ community_operator_pipeline_pending_namespace }}"
+              - name: pipeline_image
+                value: "{{ operator_pipeline_image_pull_spec }}"
+              - name: quay_oauth_secret_name
+                value: "community-quay-oauth-token"
+              - name: kerberos_keytab_secret_key
+                value: "krb5-community-pending.keytab"
+              - name: hydra_sso_token_url
+                value: "{{ operator_pipeline_hydra_sso_token_url }}"
+              - name: static_test_suites
+                value: operatorcert.static_tests.community,operatorcert.static_tests.common
+              - name: cert_project_required
+                value: "false"
+
+    - name: Create Community hosted pipeline Trigger template
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ oc_namespace }}"
+        definition:
+          apiVersion: triggers.tekton.dev/v1alpha1
+          kind: TriggerTemplate
+          metadata:
+            name: community-operator-hosted-pipeline-trigger-template
+            labels:
+              app: operator-pipeline
+              suffix: "{{ suffix }}"
+              env: "{{ env }}"
+          spec:
+            params:
+              - name: git_pr_url
+              - name: git_fork_url
+              - name: git_repo_url
+              - name: git_base_branch
+              - name: git_username
+              - name: git_commit
+              - name: git_commit_base
+              - name: env
+              - name: preflight_trigger_environment
+              - name: image_namespace
+              - name: pipeline_image
+              - name: quay_oauth_secret_name
+              - name: kerberos_keytab_secret_key
+              - name: hydra_sso_token_url
+              - name: static_test_suites
+              - name: cert_project_required
+            resourcetemplates:
+              - apiVersion: tekton.dev/v1
+                kind: PipelineRun
+                metadata:
+                  generateName: operator-hosted-pipeline-run
+                  labels:
+                    app: operator-pipeline
+                    suffix: "{{ suffix }}"
+                    env: "{{ env }}"
+                    git_commit: $(tt.params.git_commit)
+                  annotations:
+                    git_pull_request_url: $(tt.params.git_pr_url)
+                spec:
+                  timeouts:
+                    pipeline: "2h"
+                    tasks: "1h50m"
+                  pipelineRef:
+                    name: operator-hosted-pipeline
+                  params:
+                    - name: git_pr_url
+                      value: $(tt.params.git_pr_url)
+                    - name: git_fork_url
+                      value: $(tt.params.git_fork_url)
+                    - name: git_repo_url
+                      value: $(tt.params.git_repo_url)
+                    - name: git_base_branch
+                      value: $(tt.params.git_base_branch)
+                    - name: git_username
+                      value: $(tt.params.git_username)
+                    - name: git_commit
+                      value: $(tt.params.git_commit)
+                    - name: git_commit_base
+                      value: $(tt.params.git_commit_base)
+                    - name: env
+                      value: $(tt.params.env)
+                    - name: preflight_trigger_environment
+                      value: $(tt.params.preflight_trigger_environment)
+                    - name: image_namespace
+                      value: $(tt.params.image_namespace)
+                    - name: pipeline_image
+                      value: $(tt.params.pipeline_image)
+                    - name: quay_oauth_secret_name
+                      value: $(tt.params.quay_oauth_secret_name)
+                    - name: kerberos_keytab_secret_key
+                      value: $(tt.params.kerberos_keytab_secret_key)
+                    - name: hydra_sso_token_url
+                      value: $(tt.params.hydra_sso_token_url)
+                    - name: static_test_suites
+                      value: $(tt.params.static_test_suites)
+                    - name: cert_project_required
+                      value: $(tt.params.cert_project_required)
+                  workspaces:
+                    - name: repository
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 7Gi
+                    - name: results
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 100Mi
+                    - name: registry-credentials-all
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 100Mi
+                    - name: registry-credentials
+                      secret:
+                        secretName: community-hosted-pipeline-registry-auth-secret
+                    - name: ssh-dir
+                      secret:
+                        secretName: github-rh-operator-bundle-bot-ssh-credentials

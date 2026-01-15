@@ -1,0 +1,15 @@
+---
+# Branch containing the source operator bundle to copy
+integration_tests_src_operator_git_branch: main
+
+# The branch representing the upstream/base state to copy
+integration_tests_git_base_branch: main
+
+# Replace the source bundle's version
+integration_tests_operator_bundle_version: 0.0.1
+
+# Copy the bundle into this branch
+integration_tests_git_bundle_branch: "{{ integration_tests_operator_package_name }}-{{ integration_tests_operator_bundle_version }}-head"
+
+# Raise pull requests against this upstream branch
+integration_tests_git_upstream_branch: "{{ integration_tests_operator_package_name }}-{{ integration_tests_operator_bundle_version }}-base"

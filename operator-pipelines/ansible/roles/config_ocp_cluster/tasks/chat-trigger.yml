@@ -1,0 +1,106 @@
+---
+- name: Create Chat trigger resources
+  tags:
+    - chat
+  block:
+    - name: Create Tasks
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        validate_certs: "{{ k8s_validate_certs }}"
+        namespace: "{{ pipelinerun_listener_namespace }}"
+        definition: "{{ lookup('file', '{{ item }}') }}"
+      with_fileglob:
+        - ../files/tasks/*
+
+    - name: Create Slack webhook Secret
+      no_log: true
+      kubernetes.core.k8s:
+        state: present
+        force: true
+        validate_certs: "{{ k8s_validate_certs }}"
+        namespace: "{{ pipelinerun_listener_namespace }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: opaque
+          metadata:
+            name: slack
+          data:
+            slack_webhook: "{{ slack_webhook | b64encode }}"
+
+    - name: Create Chat TriggerBinding
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        namespace: "{{ pipelinerun_listener_namespace }}"
+        validate_certs: "{{ k8s_validate_certs }}"
+        definition:
+          apiVersion: triggers.tekton.dev/v1alpha1
+          kind: TriggerBinding
+          metadata:
+            name: pipelinerun-trigger-binding
+          spec:
+            params:
+              - name: namespace
+                value: $(body.pipelineRun.metadata.namespace)
+              - name: pipelinerun
+                value: $(body.pipelineRun.metadata.name)
+              - name: git_pr_url
+                value: $(body.pipelineRun.spec.params[?(@.name=='git_pr_url')].value)
+
+    - name: Create Chat TriggerTemplate
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        namespace: "{{ pipelinerun_listener_namespace }}"
+        validate_certs: "{{ k8s_validate_certs }}"
+        definition:
+          apiVersion: triggers.tekton.dev/v1alpha1
+          kind: TriggerTemplate
+          metadata:
+            name: pipelinerun-trigger-template
+          spec:
+            params:
+              - name: namespace
+              - name: pipelinerun
+              - name: git_pr_url
+                default: ""
+            resourcetemplates:
+              - apiVersion: tekton.dev/v1
+                kind: TaskRun
+                metadata:
+                  # Tekton may produce duplicate CloudEvents. Use a consistent Task
+                  # name to make this trigger idempotent.
+                  name: $(tt.params.pipelinerun)
+                spec:
+                  timeout: "5m"
+                  params:
+                    - name: namespace
+                      value: $(tt.params.namespace)
+                    - name: pipelinerun
+                      value: $(tt.params.pipelinerun)
+                    - name: git_pr_url
+                      value: $(tt.params.git_pr_url)
+                  taskRef:
+                    name: chat-pipelinerun-summary
+
+    - name: Create ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        namespace: "{{ pipelinerun_listener_namespace }}"
+        validate_certs: "{{ k8s_validate_certs }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: pipelinerun-listener-view-all-namespaces
+          subjects:
+            - kind: ServiceAccount
+              name: pipeline
+              namespace: "{{ pipelinerun_listener_namespace }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: tekton-aggregate-view

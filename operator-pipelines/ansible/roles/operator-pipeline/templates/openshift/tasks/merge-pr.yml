@@ -1,0 +1,104 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: merge-pr
+spec:
+  description: Merge a GitHub pull request
+  params:
+    - name: pipeline_image
+    - name: git_pr_url
+      description: URL of the GitHub pull request.
+    - name: git_head_commit
+      description: SHA of the head of the branch to be merged.
+    - name: operator_path
+      description: Path to the operator affected by the pull request.
+    - name: github_token_secret_name
+      description: The name of the Kubernetes Secret that contains the GitHub token.
+      default: github
+    - name: github_token_secret_key
+      description: The key within the Kubernetes Secret that contains the GitHub token.
+      default: token
+  workspaces:
+    - name: source
+    - name: output
+      description: Scratch space and storage for the comment and related data
+  results:
+    - name: bool_merge
+    - name: pr_merged
+  steps:
+    - name: check-if-merge
+      image: "$(params.pipeline_image)"
+      workingDir: $(workspaces.source.path)
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+        # default is true - only set to false if specified by ci.yaml
+        if [[ -z "$(params.operator_path)" ]]; then
+          echo -n true > "$(results.bool_merge.path)"
+        elif [[ ! -f "$(params.operator_path)/ci.yaml" ]]; then
+          echo -n true > "$(results.bool_merge.path)"
+        else
+          BOOL_MERGE=$(yq -r '.merge!=false' < "$(params.operator_path)/ci.yaml")
+
+          echo -n "$BOOL_MERGE" > "$(results.bool_merge.path)"
+        fi
+
+    - name: merge-pull-request
+      image: "$(params.pipeline_image)"
+      env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      script: |
+        #! /usr/bin/env bash
+        set -x +e
+
+        BOOL_MERGE=$(cat "$(results.bool_merge.path)")
+
+        if [ "$BOOL_MERGE" = "false" ]; then
+          echo "merge explicitly set to false- not merging the Pull Request"
+          echo -n "false" > "$(results.pr_merged.path)"
+          exit 0
+        fi
+
+        # we are not using GH reviews for approval, so the only thing we need to check is the presence
+        # of 'approved' label (added by reviewer through '/approve' comment or by the pipeline)
+        gh pr view "$(params.git_pr_url)" --json labels >/tmp/pr.json
+        IS_APPROVED=$(jq -r '[.labels[].name == "approved"] | any' /tmp/pr.json || echo "false")
+
+
+        if [ "$IS_APPROVED" = "true" ]; then
+            echo "PR is approved and can be merged"
+        else
+            # Do not merge if we do not have approval
+            echo -n "Skipping merge: PR is not approved." | tee "$(workspaces.output.path)/merge_error.txt"
+            echo -n "false" > "$(results.pr_merged.path)"
+            exit 0
+        fi
+
+        # Squash and merge only if the head commit sha has not changed since
+        # the start of the pipeline run
+        MERGE_STDERR=$(gh pr merge "$(params.git_pr_url)" --squash --admin --match-head-commit "$(params.git_head_commit)" 2>&1 >/dev/null)
+        MERGE_RESULT=$?
+        MERGE_ERROR=$(echo "$MERGE_STDERR" | grep -oP '(?<=GraphQL: ).*')
+
+        if [[ $MERGE_RESULT -eq 0 ]] ; then
+            echo "PR has been merged!"
+            echo -n "true" > "$(results.pr_merged.path)"
+        else
+            echo "Cannot merge PR"
+            echo -n "false" > "$(results.pr_merged.path)"
+            # Pass details about merge error to summary comment task
+            echo -n $MERGE_ERROR | tee "$(workspaces.output.path)/merge_error.txt"
+            # Custom error message when other pipeline is running.
+            if [[ "$MERGE_ERROR" == "Head branch was modified. Review and try the merge again. (mergePullRequest)" ]] ; then
+              echo -n "Another pipeline is already in progress: please wait for the result of the new tests." | tee "$(workspaces.output.path)/merge_error.txt"
+            fi
+            # Fail pipeline if the error is not explicitly allowed.
+            if [[ "$MERGE_ERROR" != "Pull Request is still a draft (mergePullRequest)" && "$MERGE_ERROR" != "Head branch was modified. Review and try the merge again. (mergePullRequest)" ]] ; then
+              exit 1
+            fi
+        fi

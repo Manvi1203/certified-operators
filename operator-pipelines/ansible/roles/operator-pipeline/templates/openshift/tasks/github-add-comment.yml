@@ -1,0 +1,89 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: github-add-comment
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/categories: Git
+    tekton.dev/pipelines.minVersion: "0.17.0"
+    tekton.dev/tags: github
+    tekton.dev/displayName: "add github comment"
+spec:
+  description: >-
+    This Task will add a comment to a pull request or an issue.
+    It can take either a filename or a comment as input and can
+    post the comment back to GitHub accordingly.
+
+  params:
+    - name: pipeline_image
+    - name: GITHUB_HOST_URL
+      description: |
+        The GitHub host, adjust this if you run a GitHub enteprise.
+      default: "https://api.github.com"
+      type: string
+
+    - name: REQUEST_URL
+      description: |
+        The GitHub issue or pull request URL where we want to add a new
+        comment.
+      type: string
+
+    - name: COMMENT
+      description: |
+        The actual comment to add or the filename containing comment to post.
+      type: string
+
+    - name: GITHUB_TOKEN_SECRET_NAME
+      description: |
+        The name of the Kubernetes Secret that contains the GitHub token.
+      type: string
+      default: github
+
+    - name: GITHUB_TOKEN_SECRET_KEY
+      description: |
+        The key within the Kubernetes Secret that contains the GitHub token.
+      type: string
+      default: token
+
+    - name: COMMENT_TAG
+      description: |
+        An invisible tag to be added into the comment. The tag is made
+        invisible by embedding in an an HTML comment. The tag allows for later
+        retrieval of the comment, and it allows replacing an existing comment.
+      type: string
+      default: ""
+
+    - name: REPLACE
+      description: |
+        When a tag is specified, and `REPLACE` is `true`, look for a comment
+        with a matching tag and replace it with the new comment.
+      type: string
+      default: "false"  # Alternative value: "true"
+
+  steps:
+    - name: post-comment
+      env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.GITHUB_TOKEN_SECRET_NAME)
+              key: $(params.GITHUB_TOKEN_SECRET_KEY)
+
+      image: "$(params.pipeline_image)"
+      script: |
+        #! /usr/bin/env bash
+        set -xe -o pipefail
+
+        echo "$(params.COMMENT)" > comment_file
+
+        echo "Posting/patching GitHub comment to issue (or PR) $(params.REQUEST_URL)"
+        echo "Comment text: $(params.COMMENT)"
+
+        github-add-comment \
+          --github-host-url "$(params.GITHUB_HOST_URL)" \
+          --request-url "$(params.REQUEST_URL)" \
+          --comment-file comment_file \
+          --comment-tag "$(params.COMMENT_TAG)" \
+          --replace "$(params.REPLACE)"

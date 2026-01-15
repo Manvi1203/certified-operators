@@ -1,0 +1,1519 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: operator-hosted-pipeline
+spec:
+  params:
+    # When adding a new param, make sure to also add it to the webhook in
+    # operator-hosted-pipeline-trigger.yml if possible
+    - name: git_pr_url
+
+    - name: git_fork_url
+
+    - name: git_repo_url
+
+    - name: git_base_branch
+      description: The target branch in the upstream repository where the PR will be merged.
+
+    - name: git_username
+
+    - name: git_commit
+
+    - name: git_commit_base
+
+    - name: env
+      description: Which environment to run in. Can be one of [dev, qa, stage, prod]
+      default: "prod"
+
+    - name: preflight_trigger_environment
+      description: Which openshift-ci step-registry steps and ProwJob templates to use. Can be one of [preprod, prod]
+      default: "prod"
+
+    - name: registry
+      description: Must be some variety of quay registry.
+      default: quay.io
+
+    - name: image_namespace
+      default: $(context.pipelineRun.namespace)
+      description: The namespace/organization all built images will be pushed to.
+
+    - name: ignore_publishing_checklist
+      default: "false"
+      description: Ignore the results of the publishing checklist
+
+    - name: pipeline_image
+      description: An image of operator-pipeline-images.
+      default: "quay.io/redhat-isv/operator-pipelines-images:released"
+      # Kubernetes secrets related params, usually with default values
+
+    - name: github_token_secret_name
+      description: The name of the Kubernetes Secret that contains the GitHub token.
+      default: github-bot-token
+
+    - name: github_token_secret_key
+      description: The key within the Kubernetes Secret that contains the GitHub token.
+      default: github_bot_token
+
+    - name: quay_oauth_secret_name
+      default: quay-oauth-token
+
+    - name: quay_oauth_secret_key
+      default: token
+
+    - name: hydra_secret_name
+      description: Kubernetes secret name that contains the Hydra credentials.
+      default: hydra-credentials
+
+    - name: hydra_secret_sso_client_id_key
+      description: |
+        The key within the Kubernetes secret that contains Hydra SSO client ID.
+      default: sso_client_id
+
+    - name: hydra_secret_sso_client_secret_key
+      description: |
+        The key within the Kubernetes secret that contains the Hydra SSO password.
+      default: sso_client_secret
+
+    - name: hydra_sso_token_url
+      description: SSO URL.
+      default: https://auth.redhat.com/auth/realms/EmployeeIDP/protocol/openid-connect/token
+
+    - name: pipeline_ssl_secret_name
+      description: Kubernetes secret name that contains the Pipeline SSL files.
+      default: operator-pipeline-api-certs
+
+    - name: pipeline_ssl_cert_secret_key
+      description: The key within the Kubernetes secret that contains the Pipeline SSL cert.
+      default: operator-pipeline.pem
+
+    - name: pipeline_ssl_key_secret_key
+      description: The key within the Kubernetes secret that contains the Pipeline SSL key.
+      default: operator-pipeline.key
+
+    - name: kerberos_keytab_secret_name
+      description: >-
+        The name of the Kubernetes Secret that contains the kerberos keytab for submitting IIB builds.
+      default: kerberos-keytab
+
+    - name: kerberos_keytab_secret_key
+      description: >-
+        The key within the Kubernetes Secret that contains the kerberos keytab for submitting IIB builds.
+      default: krb5-isv-pending.keytab
+
+    - name: prow_kubeconfig_secret_name
+      description: The name of the Kubernetes Secret that contains the prow kubeconfig for preflight tests.
+      default: prow-kubeconfig
+
+    - name: prow_kubeconfig_secret_key
+      description: The key within the Kubernetes Secret that contains the prow kubeconfig for preflight tests.
+      default: kubeconfig
+
+    - name: preflight_decryption_key_secret_name
+      description: The name of the Kubernetes Secret that contains the gpg decryption key.
+      default: preflight-decryption-key
+
+    - name: preflight_decryption_private_key_secret_key
+      description: The key within the Kubernetes Secret that contains the gpg private key.
+      default: private
+
+    - name: preflight_decryption_public_key_secret_key
+      description: The key within the Kubernetes Secret that contains the gpg public key.
+      default: public
+
+    - name: gpg_secret_name
+      description: >-
+        The name of the Kubernetes Secret that contains the GPG private key that is used for decryption of user's tokens.
+      default: isv-gpg-key
+
+    - name: gpg_key_secret_key
+      description: The key within the Kubernetes Secret that contains the gpg key.
+      default: operator-pipeline-gpg.key
+
+    - name: gpg_passphrase_secret_key
+      description: The key within the Kubernetes Secret that contains the gpg passphrase.
+      default: operator-pipeline-gpg.passphrase
+
+    - name: static_test_suites
+      description: A comma separate list of paths to a test suite that is executed
+      default: operatorcert.static_tests.isv,operatorcert.static_tests.common
+
+    - name: cert_project_required
+      description: >-
+        A flag determines whether a cert project identifier is required
+        for the pipeline. The flag distinguish between ISV and community operators.
+      default: "true"
+
+  workspaces:
+    - name: repository
+    - name: results
+    - name: ssh-dir
+      optional: true
+    - name: registry-credentials
+    - name: registry-credentials-all
+      description:
+        Storage space for the result of merging certification project and
+        pipeline service account registry tokens.
+  tasks:
+    # extract the PR number from the PR URL
+    - name: get-pr-number
+      taskRef:
+        name: get-pr-number
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: git_pr_url
+          value: "$(params.git_pr_url)"
+
+    # acquire/lease the resource to resolve the conflict of concurrent pipelineruns
+    - name: acquire-lease
+      runAfter:
+        - get-pr-number
+      taskRef:
+        name: acquire-lease
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: lease-name
+          value: "operator-hosted-pipeline-pr-$(tasks.get-pr-number.results.git_pr_number)"
+        - name: lease-owner
+          value: "$(context.pipelineRun.name)"
+
+    # Set a initial PR label with indication that pipeline has started
+    - name: set-github-started-label
+      runAfter:
+        - acquire-lease
+      taskRef:
+        name: github-labels
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: add_labels
+          value: "$(context.pipeline.name)/started"
+        - name: remove_labels
+          value: "pipeline/trigger-hosted"
+        - name: remove-matching-namespace-labels
+          value: "true"
+
+    # Set a pending GitHub status check first to provide the user with immediate feedback.
+    - name: set-github-status-pending
+      taskRef:
+        name: set-github-status
+      runAfter:
+        - acquire-lease
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: git_repo_url
+          value: $(params.git_repo_url)
+        - name: commit_sha
+          value: $(params.git_commit)
+        - name: description
+          value: "Pipeline for operator tests has started."
+        - name: state
+          value: pending
+        - name: context
+          value: "operator/test"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+
+    # Set environment
+    - name: set-env
+      runAfter:
+        - set-github-status-pending
+        - set-github-started-label
+      taskRef:
+        name: set-env
+        kind: Task
+      params:
+        - name: env
+          value: $(params.env)
+        - name: access_type
+          value: "internal"
+
+    # Git clone
+    - name: clone-repository
+      runAfter:
+        - set-env
+      taskRef:
+        name: git-clone
+        kind: Task
+      params:
+        - name: url
+          value: $(params.git_fork_url)
+        - name: revision
+          value: $(params.git_commit)
+        - name: gitInitImage
+          value: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8@sha256:bc551c776fb3d0fcc6cfd6d8dc9f0030de012cb9516fac42b1da75e6771001d9
+      workspaces:
+        - name: output
+          workspace: repository
+          subPath: src
+        - name: ssh-directory
+          workspace: ssh-dir
+
+    # Clone the repository contents from the base branch
+    - name: clone-repository-base
+      taskRef:
+        name: git-clone
+        kind: Task
+      runAfter:
+        - set-env
+      params:
+        - name: url
+          value: "$(params.git_repo_url)"
+        - name: revision
+          value: "$(params.git_commit_base)"
+        - name: gitInitImage
+          value: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8@sha256:bc551c776fb3d0fcc6cfd6d8dc9f0030de012cb9516fac42b1da75e6771001d9
+      workspaces:
+        - name: output
+          workspace: repository
+          subPath: base
+        - name: ssh-directory
+          workspace: ssh-dir
+
+    # Detect operator bundle repository changes
+    - name: detect-changes
+      taskRef:
+        name: parse-repo-changes
+        kind: Task
+      runAfter:
+        - clone-repository
+        - clone-repository-base
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+      workspaces:
+        - name: pr
+          workspace: repository
+          subPath: src
+        - name: base
+          workspace: repository
+          subPath: base
+        - name: output
+          workspace: results
+          subPath: changes
+
+    - name: yaml-lint
+      runAfter:
+        - detect-changes
+      taskRef:
+        name: yaml-lint
+      when:
+        - input: "$(tasks.detect-changes.results.bundle_path)"
+          operator: notin
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: args
+          value: "-d {extends: default, rules: {line-length: {max: 180, level: warning}, indentation: {indent-sequences: whatever}}}"
+        - name: path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+      workspaces:
+        - name: shared-workspace
+          workspace: repository
+          subPath: src
+
+    - name: check-permissions
+      taskRef:
+        name: check-permissions
+        kind: Task
+      runAfter:
+        - yaml-lint
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: git_username
+          value: "$(params.git_username)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+      workspaces:
+        - name: pr
+          workspace: repository
+          subPath: src
+        - name: base
+          workspace: repository
+          subPath: base
+        - name: output
+          workspace: results
+          subPath: changes
+
+    - name: set-github-pr-title
+      taskRef:
+        name: set-github-pr-title
+        kind: Task
+      runAfter:
+        - check-permissions
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: affected_catalogs
+          value: "$(tasks.detect-changes.results.affected_catalogs)"
+        - name: affected_catalog_operators
+          value: "$(tasks.detect-changes.results.affected_catalog_operators)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+
+    - name: read-config
+      taskRef:
+        name: read-config
+        kind: Task
+      runAfter:
+        - set-github-pr-title
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: operator_path
+          value: "$(tasks.detect-changes.results.operator_path)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: output
+          workspace: results
+          subPath: summary
+
+    - name: resolve-pr-type
+      taskRef:
+        name: resolve-pr-type
+        kind: Task
+      runAfter:
+        - read-config
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+        - name: affected_catalogs
+          value: "$(tasks.detect-changes.results.affected_catalogs)"
+        - name: affected_catalog_operators
+          value: "$(tasks.detect-changes.results.affected_catalog_operators)"
+        - name: fbc-enabled
+          value: "$(tasks.read-config.results.fbc-enabled)"
+
+    - name: validate-catalog-format
+      taskRef:
+        name: validate-catalog-format
+        kind: Task
+      runAfter:
+        - resolve-pr-type
+      when:
+        - input: "$(tasks.detect-changes.results.added_or_modified_catalogs)"
+          operator: notin
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: affected_catalogs
+          value: "$(tasks.detect-changes.results.added_or_modified_catalogs)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+
+    - name: build-fragment-images
+      taskRef:
+        name: build-fragment-images
+        kind: Task
+      runAfter:
+        - validate-catalog-format
+      when:
+        - &catalogFileChange
+          input: "$(tasks.detect-changes.results.added_or_modified_catalogs)"
+          operator: notin
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: commit_sha
+          value: $(params.git_commit)
+        - name: affected_catalog_operators
+          value: "$(tasks.detect-changes.results.added_or_modified_catalog_operators)"
+        - name: fragment_repository
+          value: "$(params.registry)/$(params.image_namespace)/catalog"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: credentials
+          workspace: registry-credentials
+
+    - name: apply-test-waivers
+      taskRef:
+        name: apply-test-waivers
+        kind: Task
+      runAfter:
+        - build-fragment-images
+      when:
+        - &bundleAdded
+          input: "$(tasks.detect-changes.results.added_bundle)"
+          operator: notin
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+      workspaces:
+        - name: base
+          workspace: repository
+          subPath: base
+
+    - name: content-hash
+      taskRef:
+        name: content-hash
+      runAfter:
+        - apply-test-waivers
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+
+    # Get cert project id
+    - name: certification-project-check
+      runAfter:
+        - content-hash
+      taskRef:
+        name: certification-project-check
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: affected_operators
+          value: "$(tasks.detect-changes.results.affected_operators)"
+        - name: affected_catalog_operators
+          value: "$(tasks.detect-changes.results.affected_catalog_operators)"
+        - name: cert_project_required
+          value: "$(params.cert_project_required)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+
+    - name: get-organization
+      runAfter:
+        - certification-project-check
+      taskRef:
+        name: get-organization
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+
+    # Get cert project related data
+    - name: get-pyxis-certification-data
+      runAfter:
+        - get-organization
+      taskRef:
+        name: get-pyxis-certification-data
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: results
+          workspace: results
+
+    - name: verify-project
+      runAfter:
+        - get-pyxis-certification-data
+      taskRef:
+        name: verify-project
+      when:
+        - &certProjectExists
+          input: "$(tasks.certification-project-check.results.certification_project_id)"
+          operator: "notin"
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: project_distribution
+          value: "$(tasks.get-pyxis-certification-data.results.operator_distribution)"
+        - name: organization
+          value: "$(tasks.get-organization.results.organization)"
+        - name: project_status
+          value: "$(tasks.get-pyxis-certification-data.results.project_status)"
+
+    # Updates certification status to "In Progress", if not already "Published".
+    # See the get-pyxis-certification-data task for how that's determined.
+    - name: update-cert-project-status
+      runAfter:
+        - verify-project
+      taskRef:
+        name: update-cert-project-status
+      when:
+        - *certProjectExists
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: new_certification_status
+          value: "$(tasks.get-pyxis-certification-data.results.new_certification_status)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+        - name: current_certification_status
+          value: "$(tasks.get-pyxis-certification-data.results.current_certification_status)"
+
+    # reserve operator name
+    - name: reserve-operator-name
+      runAfter:
+        - update-cert-project-status
+      taskRef:
+        name: reserve-operator-name
+      when:
+        - *certProjectExists
+        - *bundleAdded
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: association
+          value: "$(tasks.get-pyxis-certification-data.results.isv_pid)"
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+        - name: source
+          value: "$(tasks.get-organization.results.organization)"
+
+    - name: static-tests
+      taskRef:
+        name: run-static-tests
+        kind: Task
+      runAfter:
+        - reserve-operator-name
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: affected_catalog_operators
+          value: "$(tasks.detect-changes.results.affected_catalog_operators)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: test_suites
+          value: "$(params.static_test_suites)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: output
+          workspace: results
+          subPath: summary
+
+
+    # Merge user's registry tokens with service account credentials
+    # used elsewhere by this pipeline.
+    #
+    # NOTE: The project credentials will always "win" if there is a
+    # matching registry entry in the registry-credentials workspace.
+    # For example, if the partner provides credentials to quay.io,
+    # our credentials for that registry will be omitted.
+    - name: merge-registry-credentials
+      runAfter:
+        - static-tests
+      taskRef:
+        name: merge-registry-credentials
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: gpg_secret_name
+          value: "$(params.gpg_secret_name)"
+        - name: gpg_key_secret_key
+          value: "$(params.gpg_key_secret_key)"
+        - name: gpg_passphrase_secret_key
+          value: "$(params.gpg_passphrase_secret_key)"
+      workspaces:
+        - name: registry-credentials-all
+          workspace: registry-credentials-all
+        - name: registry-credentials
+          workspace: registry-credentials
+        - name: project-data
+          workspace: results
+
+    - name: digest-pinning
+      runAfter:
+        - merge-registry-credentials
+      taskRef:
+        name: digest-pinning
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+        # Pin digest only for ISV projects
+        - name: enabled
+          value: "$(params.cert_project_required)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: registry-credentials
+          workspace: registry-credentials-all
+
+    - name: verify-pinned-digest
+      runAfter:
+        - digest-pinning
+      taskRef:
+        name: verify-pinned-digest
+      params:
+        - name: dirty_flag
+          value: "$(tasks.digest-pinning.results.dirty_flag)"
+        - name: related_images_flag
+          value: "$(tasks.digest-pinning.results.related_images_flag)"
+        - name: related_images_message
+          value: "$(tasks.digest-pinning.results.related_images_message)"
+
+    # Build images- bundle and index and push them to registry.
+    # Those steps are also a part of the CI pipeline.
+    - name: dockerfile-creation
+      runAfter:
+        - verify-pinned-digest
+      taskRef:
+        name: dockerfile-creation
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+
+    # Bundle Image (Operator Bundle) is a container image that stores
+    # Kubernetes manifests and metadata associated with an operator.
+    # A bundle is meant to represent a specific version of an operator on cluster.
+    - name: build-bundle
+      runAfter:
+        - dockerfile-creation
+      taskRef:
+        name: buildah
+        kind: Task
+      params:
+        - name: IMAGE
+          value: &bundleImage "$(params.registry)/$(params.image_namespace)/$(tasks.detect-changes.results.added_operator):$(tasks.detect-changes.results.added_bundle)"
+        - name: CONTEXT
+          value: "$(tasks.detect-changes.results.bundle_path)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: dockerconfig
+          # Do not use registry-credentials-all. Project creds may replace quay.io push creds.
+          workspace: registry-credentials
+
+    - name: make-bundle-repo-public
+      runAfter:
+        - build-bundle
+      when:
+        - &operatorOrBundleChange
+          input: "$(tasks.detect-changes.results.affected_catalogs)"
+          operator: in
+          values: [""]
+      taskRef:
+        name: set-quay-repo-visibility
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: repository
+          value: "$(params.image_namespace)/$(tasks.detect-changes.results.added_operator)"
+        - name: visibility
+          value: public
+        - name: oauth_secret_name
+          value: "$(params.quay_oauth_secret_name)"
+        - name: oauth_secret_key
+          value: "$(params.quay_oauth_secret_key)"
+
+    - name: get-supported-versions
+      runAfter:
+        - make-bundle-repo-public
+      taskRef:
+        name: get-supported-versions
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+
+    - name: build-fbc-index-images
+      runAfter:
+        - get-supported-versions
+      when:
+        - *catalogFileChange
+      taskRef:
+        name: build-fbc-index-images
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: index_images
+          value: "$(tasks.get-supported-versions.results.indices)"
+        - name: commit_sha
+          value: "$(params.git_commit)"
+        - name: catalogs_with_added_or_modified_operators
+          value: "$(tasks.detect-changes.results.catalogs_with_added_or_modified_operators)"
+        - name: deleted_catalog_operators
+          value: "$(tasks.detect-changes.results.deleted_catalog_operators)"
+        - name: image_repository
+          value: "$(params.registry)/$(params.image_namespace)/catalog"
+        - name: iib_url
+          value: "$(tasks.set-env.results.iib_url)"
+        - name: environment
+          value: "$(params.env)"
+        - name: kerberos_keytab_secret_name
+          value: "$(params.kerberos_keytab_secret_name)"
+        - name: kerberos_keytab_secret_key
+          value: "$(params.kerberos_keytab_secret_key)"
+      workspaces:
+        - name: output
+          workspace: results
+          subPath: paths
+
+    # Build new temporary index using IIB
+    - name: add-bundle-to-index
+      runAfter:
+        - build-fbc-index-images
+      when:
+        # Run only when a bundle is added and it doesn't use FBC
+        - *bundleAdded
+        - &isNotFBC
+          input: "$(tasks.read-config.results.fbc-enabled)"
+          operator: notin
+          values: ["true"]
+      taskRef:
+        name: add-bundle-to-index
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: index_images
+          value: "$(tasks.get-supported-versions.results.max_supported_index)"
+        - name: bundle_pullspec
+          value: *bundleImage
+        - name: environment
+          value: "$(params.env)"
+        - name: kerberos_keytab_secret_name
+          value: "$(params.kerberos_keytab_secret_name)"
+        - name: kerberos_keytab_secret_key
+          value: "$(params.kerberos_keytab_secret_key)"
+        - name: index-image-destination
+          value: &tempIndexRepo "$(params.registry)/$(params.image_namespace)/catalog"
+        - name: index-image-destination-tag-suffix
+          value: "-$(params.git_commit)"
+        - name: iib_url
+          value: "$(tasks.set-env.results.iib_url)"
+        - name: upgrade-graph-mode
+          value: "$(tasks.read-config.results.upgrade-graph-mode)"
+      workspaces:
+        - name: credentials
+          workspace: registry-credentials
+        - name: output
+          workspace: results
+          subPath: paths
+
+    - name: build-fbc-scratch-catalog
+      runAfter:
+        - build-fbc-index-images
+      when:
+        # Run only when a bundle is added and it uses FBC
+        - *bundleAdded
+        - &isFBC
+          input: "$(tasks.read-config.results.fbc-enabled)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        name: build-fbc-scratch-catalog
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: ocp_version
+          value: "$(tasks.get-supported-versions.results.max_supported_ocp_version)"
+        - name: bundle_pullspec
+          value: *bundleImage
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: index_image_destination
+          value: *tempIndexRepo
+        - name: index_image_destination_tag_suffix
+          value: "-$(params.git_commit)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: credentials
+          workspace: registry-credentials
+
+    - name: make-index-repo-public
+      runAfter:
+        - add-bundle-to-index
+        - build-fbc-scratch-catalog
+      when:
+        - *operatorOrBundleChange
+      taskRef:
+        name: set-quay-repo-visibility
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: repository
+          value: "$(params.image_namespace)/catalog"
+        - name: visibility
+          value: public
+        - name: oauth_secret_name
+          value: "$(params.quay_oauth_secret_name)"
+        - name: oauth_secret_key
+          value: "$(params.quay_oauth_secret_key)"
+
+    # Try to retrieve preflight tests results
+    # (they can run on premise)
+    - name: get-ci-results-attempt
+      runAfter:
+        - make-index-repo-public
+      taskRef:
+        name: get-ci-results-attempt
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: md5sum
+          value: "$(tasks.content-hash.results.md5sum)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+      workspaces:
+        - name: results
+          workspace: results
+
+    - name: preflight-trigger
+      runAfter:
+        - get-ci-results-attempt
+      taskRef:
+        kind: Task
+        name: preflight-trigger
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: preflight_trigger_environment
+          value: "$(params.preflight_trigger_environment)"
+        - name: ocp_version
+          value: "$(tasks.get-supported-versions.results.max_supported_ocp_version)"
+        - name: asset_type
+          value: operator
+        - name: bundle_index_image
+          value: >-
+            $(params.registry)/$(params.image_namespace)/catalog:v$(tasks.get-supported-versions.results.max_supported_ocp_version)-$(params.git_commit)
+        - name: bundle_image
+          value: >-
+            $(params.registry)/$(params.image_namespace)/$(tasks.detect-changes.results.added_operator):$(tasks.detect-changes.results.added_bundle)
+        - name: gpg_decryption_key_secret_name
+          value: "$(params.preflight_decryption_key_secret_name)"
+        - name: gpg_decryption_private_key_secret_key
+          value: "$(params.preflight_decryption_private_key_secret_key)"
+        - name: gpg_decryption_public_key_secret_key
+          value: "$(params.preflight_decryption_public_key_secret_key)"
+        - name: prow_kubeconfig_secret_name
+          value: "$(params.prow_kubeconfig_secret_name)"
+        - name: prow_kubeconfig_secret_key
+          value: "$(params.prow_kubeconfig_secret_key)"
+        - name: test_result_path
+          value: "$(tasks.get-ci-results-attempt.results.preflight_results)"
+        # Skip preflight trigger in case there was a previous SUCCESSFUL test
+        # The test could be executed in CI or hosted pipeline but it needs
+        # to be successful. Previous failed test don't skip this task.
+        - name: skip
+          value: "$(tasks.get-ci-results-attempt.results.preflight_results_exists)"
+        - name: bundle_path
+          value: "$(tasks.detect-changes.results.bundle_path)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+      workspaces:
+        - name: credentials
+          workspace: registry-credentials-all
+        - name: results
+          workspace: results
+
+    - name: upload-artifacts
+      runAfter:
+        - preflight-trigger
+      taskRef:
+        name: upload-artifacts
+      when:
+        - input: "$(tasks.certification-project-check.results.certification_project_id)"
+          operator: "notin"
+          values: [""]
+        - input: "$(tasks.detect-changes.results.added_or_modified_bundles)"
+          operator: "notin"
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: preflight_results_exists
+          value: "$(tasks.get-ci-results-attempt.results.preflight_results_exists)"
+        - name: log_file
+          value: "$(tasks.preflight-trigger.results.log_output_file)"
+        - name: artifacts_dir
+          value: "$(tasks.preflight-trigger.results.artifacts_output_dir)"
+        - name: result_file
+          value: "$(tasks.preflight-trigger.results.result_output_file)"
+        - name: md5sum
+          value: "$(tasks.content-hash.results.md5sum)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: package_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: connect_url
+          value: "$(tasks.set-env.results.connect_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+      workspaces:
+        - name: results
+          workspace: results
+
+    - name: evaluate-preflight-result
+      runAfter:
+        - upload-artifacts
+      taskRef:
+        kind: Task
+        name: evaluate-preflight-result
+      when:
+        - input: "$(tasks.detect-changes.results.added_bundle)"
+          operator: notin
+          values: [""]
+        - input: "$(tasks.detect-changes.results.affected_catalogs)"
+          operator: in
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: preflight_result_file_path
+          value: "$(tasks.preflight-trigger.results.result_output_file)"
+        - name: preflight_log_file_path
+          value: "$(tasks.preflight-trigger.results.log_output_file)"
+        - name: preflight_artifacts_output_dir
+          value: "$(tasks.preflight-trigger.results.artifacts_output_dir)"
+      workspaces:
+        - name: results
+          workspace: results
+        - name: source
+          workspace: repository
+          subPath: src
+
+    - name: get-ci-results
+      runAfter:
+        - evaluate-preflight-result
+      taskRef:
+        name: get-ci-results
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: preflight_results_exists
+          value: "$(tasks.get-ci-results-attempt.results.preflight_results_exists)"
+        - name: preflight_results
+          value: "$(tasks.get-ci-results-attempt.results.preflight_results)"
+        - name: test_result_id
+          value: "$(tasks.get-ci-results-attempt.results.test_result_id)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: md5sum
+          value: "$(tasks.content-hash.results.md5sum)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+      workspaces:
+        - name: results
+          workspace: results
+          subPath: results
+
+    # link pull request details to test results
+    - name: link-pull-request-with-open-status
+      runAfter:
+        - get-ci-results
+      taskRef:
+        name: link-pull-request
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: test_result_id
+          value: "$(tasks.get-ci-results.results.test_result_id)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: pull_request_status
+          value: "open"
+
+    # Query Hydra API for status of the pre-certification checklist
+    - name: query-publishing-checklist
+      runAfter:
+        - link-pull-request-with-open-status
+      taskRef:
+        name: query-publishing-checklist
+      when:
+        - input: "$(tasks.certification-project-check.results.certification_project_id)"
+          operator: "notin"
+          values: [""]
+        - input: "$(tasks.detect-changes.results.affected_catalogs)"
+          operator: in
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: connect_url
+          value: "$(tasks.set-env.results.connect_url)"
+        - name: hydra_secret_name
+          value: "$(params.hydra_secret_name)"
+        - name: hydra_secret_sso_client_id_key
+          value: "$(params.hydra_secret_sso_client_id_key)"
+        - name: hydra_secret_sso_client_secret_key
+          value: "$(params.hydra_secret_sso_client_secret_key)"
+        - name: hydra_sso_token_url
+          value: "$(params.hydra_sso_token_url)"
+        - name: ignore_publishing_checklist
+          value: "$(params.ignore_publishing_checklist)"
+
+    - name: add-bundle-to-fbc-dryrun
+      runAfter:
+        - query-publishing-checklist
+      taskRef:
+        kind: Task
+        name: add-bundle-to-fbc
+      when:
+        - input: "$(tasks.detect-changes.results.added_bundle)"
+          operator: notin
+          values: [""]
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: bundle_pullspec
+          value: *bundleImage
+        - name: operator_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: operator_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: git_base_branch
+          value: "$(params.git_base_branch)"
+        - name: github_origin_pr_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: output
+          workspace: results
+          subPath: summary
+        - name: registry-credentials
+          workspace: registry-credentials
+
+    # merge PR
+    - name: merge-pr
+      runAfter:
+        - add-bundle-to-fbc-dryrun
+      taskRef:
+        name: merge-pr
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: git_pr_url
+          value: $(params.git_pr_url)
+        - name: git_head_commit
+          value: $(params.git_commit)
+        - name: operator_path
+          value: "$(tasks.detect-changes.results.operator_path)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: src
+        - name: output
+          workspace: results
+          subPath: summary
+
+    # link pull request details to test results
+    - name: link-pull-request-with-merged-status
+      runAfter:
+        - merge-pr
+      when:
+        - input: $(tasks.merge-pr.results.pr_merged)
+          operator: in
+          values: ["true"]
+      taskRef:
+        name: link-pull-request
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: test_result_id
+          value: "$(tasks.get-ci-results.results.test_result_id)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: pull_request_status
+          value: "merged"
+
+  finally:
+    # Upload the logs of this pipeline.
+    # Dependencies on other task results should be minimized. If any
+    # of those tasks fail, it'll prevent this task from executing.
+    - name: upload-pipeline-logs
+      taskRef:
+        name: upload-pipeline-logs
+      when:
+        - *certProjectExists
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: md5sum
+          value: "$(tasks.content-hash.results.md5sum)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: bundle_version
+          value: "$(tasks.detect-changes.results.added_bundle)"
+        - name: git_pr_url
+          value: $(params.git_pr_url)
+        - name: package_name
+          value: "$(tasks.detect-changes.results.added_operator)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pipeline_name
+          value: "$(context.pipeline.name)"
+        - name: pipelinerun_name
+          value: "$(context.pipelineRun.name)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pipeline_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pipeline_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pipeline_ssl_key_secret_key)"
+      workspaces:
+        - name: source
+          workspace: repository
+
+    # In the event of a pipeline failure, this task will post a comment
+    # with the support link pointing to the affected PR
+    - name: post-support-link-for-pr
+      when:
+        - input: "$(tasks.certification-project-check.results.certification_project_id)"
+          operator: "notin"
+          values: [""]
+        - input: $(tasks.status)
+          operator: notin
+          values: ["Succeeded", "Completed"]
+      taskRef:
+        name: create-support-link-for-pr
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: connect_url
+          value: $(tasks.set-env.results.connect_url)
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: pull_request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+      workspaces:
+        - name: output
+          workspace: results
+          subPath: summary
+
+    # Add the connect page URL in github PR comment to view the test results/logs
+    - name: github-add-connect-url-comment
+      taskRef:
+        name: github-add-comment
+      when:
+        - *certProjectExists
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: REQUEST_URL
+          value: "$(params.git_pr_url)"
+        - name: COMMENT
+          value: "[View your certification test results and logs here]($(tasks.set-env.results.connect_url)/projects/$(tasks.certification-project-check.results.certification_project_id)/test-results)."
+        - name: GITHUB_TOKEN_SECRET_NAME
+          value: "$(params.github_token_secret_name)"
+        - name: GITHUB_TOKEN_SECRET_KEY
+          value: "$(params.github_token_secret_key)"
+
+    - name: set-github-passed-label
+      when:
+        - input: "$(tasks.status)"
+          operator: in
+          values:
+            - Succeeded
+            - Completed
+      taskRef:
+        name: github-labels
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: add_labels
+          value: "$(context.pipeline.name)/passed"
+        - name: remove-matching-namespace-labels
+          value: "true"
+
+    - name: set-github-failed-label
+      when:
+        - input: "$(tasks.status)"
+          operator: notin
+          values:
+            - Succeeded
+            - Completed
+      taskRef:
+        name: github-labels
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: add_labels
+          value: "$(context.pipeline.name)/failed"
+        - name: remove-matching-namespace-labels
+          value: "true"
+
+    # Set the github status to success if the pipeline passed
+    - name: set-github-status-success
+      when:
+        - input: "$(tasks.status)"
+          operator: in
+          values: ["Succeeded", "Completed"]
+      taskRef:
+        name: set-github-status
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: git_repo_url
+          value: $(params.git_repo_url)
+        - name: commit_sha
+          value: $(params.git_commit)
+        - name: description
+          value: "Pipeline for the operator tests has passed successfully."
+        - name: state
+          value: success
+        - name: context
+          value: "operator/test"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+
+    # Set the github status to failure if the pipeline didn't pass.
+    - name: set-github-status-failure
+      when:
+        - input: "$(tasks.status)"
+          operator: notin
+          values:
+            - Succeeded
+            - Completed
+      taskRef:
+        name: set-github-status
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: git_repo_url
+          value: $(params.git_repo_url)
+        - name: commit_sha
+          value: $(params.git_commit)
+        - name: description
+          value: "Pipeline for the operator tests has failed."
+        - name: state
+          value: failure
+        - name: context
+          value: "operator/test"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+
+    # Comment with a pipeline summary
+    - name: github-add-summary-comment
+      taskRef:
+        name: github-pipelinerun-summary
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: request_url
+          value: "$(params.git_pr_url)"
+        - name: github_token_secret_name
+          value: "$(params.github_token_secret_name)"
+        - name: github_token_secret_key
+          value: "$(params.github_token_secret_key)"
+        - name: pipelinerun
+          value: "$(context.pipelineRun.name)"
+        - name: upload_pipeline_logs
+          value: "true"
+        - name: pipeline_name
+          value: "$(context.pipeline.name)"
+        - name: pipeline_status
+          value: "$(tasks.status)"
+      workspaces:
+        - name: base
+          workspace: repository
+          subPath: base
+        - name: output
+          workspace: results
+          subPath: summary
+
+    # Release the acquired resource
+    - name: release-leases
+      taskRef:
+        name: release-leases
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: lease-owner
+          value: "$(context.pipelineRun.name)"

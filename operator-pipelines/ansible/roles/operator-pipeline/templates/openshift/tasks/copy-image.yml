@@ -1,0 +1,79 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: copy-image
+spec:
+  params:
+    - name: pipeline_image
+    - name: src_image
+      description: reference to the source bundle image
+    - name: dest_image_registry_namespace_certproject
+      description: reference to the destination bundle image registry
+    - name: dest_image_tag
+      description: reference to the destination bundle image tag
+    - name: connect_registry
+      description: Connect container registry proxy based on selected environment
+    - name: vendor_label
+      description: A label of company that owns a certification
+    - name: repo_name
+      description: Repository name assigned to certification project from Red Hat Connect
+  workspaces:
+    - name: src-registry-credentials
+      description: Docker config for the source registry
+    - name: dest-registry-credentials
+      description: Docker config for the destination registry
+    - name: output
+      description: Scratch space and storage for the comment and related data
+  results:
+    - name: container_digest
+    - name: image_pullspec
+  steps:
+    - name: skopeo-copy
+      image: "$(params.pipeline_image)"
+      script: |
+        #! /usr/bin/env bash
+        set -xe
+
+        if [[ "$(params.dest_image_tag)" == "" ]]; then
+          echo "A pipeline is not releasing a bundle. Skipping a copy step.."
+          echo -n > "$(results.container_digest.path)"
+          echo -n "$(params.src_image)" > "$(results.image_pullspec.path)"
+          exit 0
+        fi
+
+        # Create directory for info about release data
+        RELEASE_INFO_DIR_PATH="$(workspaces.output.path)/release_info"
+        mkdir -p "$RELEASE_INFO_DIR_PATH"
+
+        if [[ "$(params.vendor_label)" == "" ]]; then
+          echo "Image pullspec for community bundle is the source image itself."
+          echo -n > "$(results.container_digest.path)"
+          echo -n "$(params.src_image)" > "$(results.image_pullspec.path)"
+          echo "- $(params.src_image)" | tee "$RELEASE_INFO_DIR_PATH/released_bundle.txt"
+          exit 0
+        fi
+
+        SRC_AUTHFILE=$(workspaces.src-registry-credentials.path)/.dockerconfigjson
+        DEST_AUTHFILE=$(workspaces.dest-registry-credentials.path)/.dockerconfigjson
+        CONNECT_REPO_PATH="$(params.connect_registry)/$(params.vendor_label)/$(params.repo_name)"
+
+        retry 5 skopeo copy \
+          --retry-times 5 \
+          --src-authfile $SRC_AUTHFILE \
+          --dest-authfile $DEST_AUTHFILE \
+          docker://$(params.src_image) \
+          docker://"$(params.dest_image_registry_namespace_certproject):$(params.dest_image_tag)"
+
+
+        retry 5 skopeo copy \
+          --retry-times 5 \
+          --src-authfile $SRC_AUTHFILE \
+          --dest-authfile $DEST_AUTHFILE \
+          docker://$(params.src_image) \
+          docker://"$(params.dest_image_registry_namespace_certproject):latest"
+
+        DIGEST=$(retry 5 skopeo inspect --retry-times 5 --authfile $DEST_AUTHFILE docker://$(params.dest_image_registry_namespace_certproject):$(params.dest_image_tag) | jq -r .Digest)
+        echo -n $DIGEST | tee $(results.container_digest.path)
+        echo "- $CONNECT_REPO_PATH:$(params.dest_image_tag)" | tee "$RELEASE_INFO_DIR_PATH/released_bundle.txt"
+        echo -n "$CONNECT_REPO_PATH@${DIGEST}" > $(results.image_pullspec.path)

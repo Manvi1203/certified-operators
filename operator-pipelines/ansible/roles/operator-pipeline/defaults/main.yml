@@ -1,0 +1,21 @@
+---
+# defaults file for operator-pipeline
+
+## General settings
+namespace_state: present    # noqa: var-naming[no-role-prefix]
+github_webhook_state: present    # noqa: var-naming[no-role-prefix]
+
+## Index image signing pipeline settings
+index_img_bootstrap_service_accounts:
+  - index-img-bootstrap-sa
+
+index_img_bootstrap_labels:
+  app: index-img-bootstrap
+  suffix: "{{ suffix }}"
+  env: "{{ env }}"
+
+operator_pipeline_webhook_dispatcher_name: "webhook-dispatcher"
+operator_pipeline_webhook_dispatcher_db_secret_name: "{{ operator_pipeline_webhook_dispatcher_name }}-db-secret"
+operator_pipeline_webhook_dispatcher_pvc_name: "{{ operator_pipeline_webhook_dispatcher_name }}-db-pvc"
+operator_pipeline_webhook_dispatcher_config_map_name: "{{ operator_pipeline_webhook_dispatcher_name }}-config-map"
+operator_pipeline_webhook_dispatcher_config_file: "{{ operator_pipeline_webhook_dispatcher_name }}-config.yml"

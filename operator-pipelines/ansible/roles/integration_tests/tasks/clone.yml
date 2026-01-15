@@ -1,0 +1,16 @@
+---
+- name: Clone the test repo
+  tags:
+    - clone
+  block:
+    - name: Create temporary directory
+      ansible.builtin.tempfile:
+        state: directory
+      register: integration_tests_git_temp_dir
+
+    - name: Clone repository
+      ansible.builtin.git:
+        repo: "{{ integration_tests_git_repo_url }}"
+        dest: "{{ integration_tests_git_temp_dir.path }}"
+        version: "{{ integration_tests_git_base_branch }}"
+        refspec: "refs/heads/{{ integration_tests_src_operator_git_branch }}"

@@ -1,0 +1,71 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: verify-project
+spec:
+  description: >-
+    This task verifies that project is not archived and the correct distribution
+    method is used.
+  params:
+    - name: pipeline_image
+      description: The common pipeline image.
+
+    - name: organization
+      description: |
+        Organization defined in the project config.yaml - either
+        certified-operator or redhat-marketplace
+
+    - name: project_distribution
+      description: |
+        Certification project distribution method.
+
+    - name: project_status
+      description: |
+        Certification project status - either archived or active
+  steps:
+    - name: verify-project-not-archived
+      image: "$(params.pipeline_image)"
+      env:
+        - name: PROJECT_STATUS
+          value: $(params.project_status)
+      script: |
+        #! /usr/bin/env bash
+        set -xe -o pipefail
+
+        if [ "${PROJECT_STATUS}" = "archived" ]; then
+          echo "This project is archived."
+          exit 1
+        fi
+
+    - name: verify-project-distribution
+      image: "$(params.pipeline_image)"
+      env:
+        - name: ORGANIZATION
+          value: $(params.organization)
+        - name: OPERATOR_DISTRIBUTION
+          value: $(params.project_distribution)
+      script: |
+        #! /usr/bin/env bash
+        set -xe -o pipefail
+
+        case "$ORGANIZATION" in
+          "certified-operators")
+            # Undistributed operators are certified against the certified-operators catalog
+            # even if they won't be distributed to the index.
+            if [ "$OPERATOR_DISTRIBUTION" != "connect" ] && [ "$OPERATOR_DISTRIBUTION" != "undistributed" ]; then
+              echo "This project is not permitted to distribute to the $ORGANIZATION catalog."
+              exit 1
+            fi
+            ;;
+          "redhat-marketplace")
+            if [ "$OPERATOR_DISTRIBUTION" != "marketplace" ]; then
+              echo "This project is not permitted to distribute to the $ORGANIZATION catalog."
+              exit 1
+            fi
+            ;;
+          *)
+            echo "Invalid $ORGANIZATION"
+            exit 1
+            ;;
+        esac

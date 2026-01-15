@@ -1,0 +1,306 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: preflight-trigger
+spec:
+  params:
+    - name: preflight_trigger_image
+      description: Preflight trigger image
+      default: "quay.io/opdev/preflight-trigger:stable"
+
+    - name: pipeline_image
+      description: The common pipeline image.
+      default: "quay.io/redhat-isv/operator-pipelines-images:released"
+
+    - name: preflight_trigger_environment
+      description: Which openshift-ci step-registry steps and ProwJob templates to use. Can be one of [preprod, prod]
+
+    - default: '4.20'
+      name: ocp_version
+      type: string
+
+    - default: trace
+      name: log_level
+      type: string
+
+    - name: bundle_index_image
+      type: string
+
+    - name: bundle_image
+      type: string
+
+    - name: asset_type
+      type: string
+
+    - name: gpg_decryption_key_secret_name
+      description: The name of the Kubernetes Secret that contains the gpg decryption key.
+
+    - name: gpg_decryption_private_key_secret_key
+      description: The key within the Kubernetes Secret that contains the gpg private key.
+
+    - name: gpg_decryption_public_key_secret_key
+      description: The key within the Kubernetes Secret that contains the gpg public key.
+
+    - name: prow_kubeconfig_secret_name
+      description: The name of the Kubernetes Secret that contains the prow kubeconfig.
+
+    - name: prow_kubeconfig_secret_key
+      description: The key within the Kubernetes Secret that contains the prow kubeconfig.
+
+    - name: github_token_secret_key
+      description: The key within the Kubernetes Secret that contains the GitHub token.
+      default: token
+
+    - name: github_token_secret_name
+      description: The name of the Kubernetes Secret that contains the GitHub token.
+      default: github
+
+    - name: pull_request_url
+      description: "The URL of the pull request. This is used to skip the test if a PR is labeled to skip it."
+      default: ""
+
+    - name: test_result_path
+      description: "A path to existing test results. This indicates if we can skip a preflight test."
+      default: "none"
+
+    - name: skip
+      description: "Set to 'true' to skip"
+      default: 'false'
+      type: string
+
+    - name: bundle_path
+
+  results:
+    - description: ''
+      name: log_output_file
+    - description: ''
+      name: result_output_file
+    - description: ''
+      name: artifacts_output_dir
+  volumes:
+    - name: kubeconfig-volume
+      secret:
+        secretName: "$(params.prow_kubeconfig_secret_name)"
+    - name: gpg-key-volume
+      secret:
+        secretName: "$(params.gpg_decryption_key_secret_name)"
+  steps:
+    - name: skip-preflight-testing-if-labeled
+      image: "$(params.pipeline_image)"
+      workingDir: $(workspaces.results.path)
+      env:
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      script: |
+        #!/usr/bin/env bash
+        set -xe
+
+        if [[ "$(params.pull_request_url)" == "" ]]; then
+          echo "No pull request URL provided, skipping label check"
+          exit 0
+        fi
+
+        # Get labels from the pull request
+        gh pr view "$(params.pull_request_url)" --json labels > $(workspaces.results.path)/pr_labels.json
+
+        # Check if the pull request has a label to skip preflight testing using jq
+        if jq -e '.labels | any(.name == "tests/skip/preflight-trigger")' $(workspaces.results.path)/pr_labels.json; then
+          echo "Preflight testing has been skipped due to a label on the PR"
+
+          # Indicator for a rest of the steps to skip preflight testing
+          touch "$(workspaces.results.path)/preflight_skipped_by_label"
+
+          # Create a mock results.json file to indicate that preflight testing was skipped
+          cat > results.json << EOL
+          {
+            "passed": true,
+            "results": {
+              "errors": [],
+              "failed": [],
+              "passed": []
+            },
+            "test_library": {
+              "name": "github.com/redhat-openshift-ecosystem/openshift-preflight"
+            }
+          }
+        EOL
+
+          mkdir artifacts
+          touch preflight.log
+          touch artifacts/preflight.stdout
+          touch artifacts/preflight.stderr
+
+          echo -n "$(workspaces.results.path)/preflight.log" | tee "$(results.log_output_file.path)"
+          echo -n "$(workspaces.results.path)/results.json" | tee "$(results.result_output_file.path)"
+          echo -n "$(workspaces.results.path)/artifacts" | tee "$(results.artifacts_output_dir.path)"
+        fi
+
+    - env:
+        - name: PIPELINE_GPG_DECRYPTION_PRIVATE_KEY
+          value: /etc/gpg-key/$(params.gpg_decryption_private_key_secret_key)
+        - name: PIPELINE_GPG_DECRYPTION_PUBLIC_KEY
+          value: /etc/gpg-key/$(params.gpg_decryption_public_key_secret_key)
+        - name: GITHUB_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      image: "$(params.preflight_trigger_image)"
+      name: encrypt-and-encode-docker-config-json
+      computeResources: {}
+      volumeMounts:
+        - name: gpg-key-volume
+          readOnly: true
+          mountPath: "/etc/gpg-key"
+      script: |
+          #!/usr/bin/env bash
+
+          if [[ "$(params.skip)" == "true" || -z "$(params.bundle_path)" || -f "$(workspaces.results.path)/preflight_skipped_by_label" ]]; then
+              echo "Preflight testing has been skipped"
+              exit 0
+          fi
+
+          set -e
+
+          if [ -f "$(workspaces.credentials.path)/project_dockerconfigjson" ];
+          then
+              preflight-trigger encrypt \
+              --gpg-encryption-private-key "${PIPELINE_GPG_DECRYPTION_PRIVATE_KEY}" \
+              --gpg-encryption-public-key "${PIPELINE_GPG_DECRYPTION_PUBLIC_KEY}" \
+              --file "$(workspaces.credentials.path)/project_dockerconfigjson" \
+              --output-path "$(workspaces.credentials.path)/project_dockerconfigjson.gpg"
+
+              preflight-trigger encode \
+              --file "$(workspaces.credentials.path)/project_dockerconfigjson.gpg" \
+              --output-path "$(workspaces.credentials.path)/project_dockerconfigjson.gpg.b64"
+          fi
+      workingDir: $(workspaces.results.path)
+    - env:
+        - name: KUBECONFIG
+          value: /etc/kubeconfig-volume/$(params.prow_kubeconfig_secret_key)
+        - name: GITHUB_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      image: "$(params.preflight_trigger_image)"
+      imagePullPolicy: Always
+      name: create-openshift-ci-prowjob
+      computeResources: {}
+      volumeMounts:
+        - name: kubeconfig-volume
+          readOnly: true
+          mountPath: "/etc/kubeconfig-volume"
+      script: |
+          #!/usr/bin/env bash
+
+          if [[ "$(params.skip)" == "true" || -z "$(params.bundle_path)" || -f "$(workspaces.results.path)/preflight_skipped_by_label" ]]; then
+              echo "Preflight testing has been skipped"
+              exit 0
+          fi
+
+          # This is the maximum version supported by openshift-ci
+          DPTP_VER="4.20"
+          CP_VER="$(params.ocp_version)"
+
+          if [ "$(printf '%s\n' "$DPTP_VER" "$CP_VER" | sort -V | head -n1)" == "$DPTP_VER" ]; then
+              OCP_VER="${DPTP_VER}"
+          else
+              OCP_VER="${CP_VER}"
+          fi
+
+          set -e
+
+          if [ -f "$(workspaces.credentials.path)/project_dockerconfigjson.gpg.b64" ]
+          then
+              PFLT_DOCKERCONFIG="$(cat "$(workspaces.credentials.path)/project_dockerconfigjson.gpg.b64")"
+              export PFLT_DOCKERCONFIG
+
+              preflight-trigger create job \
+              --environment "$(params.preflight_trigger_environment)" \
+              --ocp-version "${OCP_VER}" \
+              --pflt-log-level "$(params.log_level)" \
+              --pflt-index-image "$(params.bundle_index_image)" \
+              --test-asset "$(params.bundle_image)" \
+              --asset-type "$(params.asset_type)" \
+              --output-path prowjob-base-url
+          else
+              preflight-trigger create job \
+              --environment "$(params.preflight_trigger_environment)" \
+              --ocp-version "${OCP_VER}" \
+              --pflt-log-level "$(params.log_level)" \
+              --pflt-index-image "$(params.bundle_index_image)" \
+              --test-asset "$(params.bundle_image)" \
+              --asset-type "$(params.asset_type)" \
+              --output-path prowjob-base-url
+          fi
+      timeout: "1h15m0s"
+      workingDir: $(workspaces.results.path)
+    - env:
+        - name: PIPELINE_GPG_DECRYPTION_PRIVATE_KEY
+          value: /etc/gpg-key/$(params.gpg_decryption_private_key_secret_key)
+        - name: PIPELINE_GPG_DECRYPTION_PUBLIC_KEY
+          value: /etc/gpg-key/$(params.gpg_decryption_public_key_secret_key)
+        - name: GITHUB_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.github_token_secret_name)
+              key: $(params.github_token_secret_key)
+      image: "$(params.preflight_trigger_image)"
+      name: get-prowjob-artifacts-and-decrypt
+      computeResources: {}
+      volumeMounts:
+        - name: gpg-key-volume
+          readOnly: true
+          mountPath: "/etc/gpg-key"
+      script: |
+          #!/usr/bin/env bash
+          if [[ -f "$(workspaces.results.path)/preflight_skipped_by_label" ]]; then
+            echo "Preflight testing has been skipped due to a label on the PR"
+            exit 0
+          fi
+
+          if [[ "$(params.skip)" == "true" || -z "$(params.bundle_path)" ]]; then
+              echo "Preflight testing has been skipped"
+              echo -n "none" > "$(results.log_output_file.path)"
+              echo -n "$(params.test_result_path)" > "$(results.result_output_file.path)"
+              echo -n "none" > "$(results.artifacts_output_dir.path)"
+              exit 0
+          fi
+
+          DPTP_VER="4.20"
+          CP_VER="$(params.ocp_version)"
+
+          if [ "$(printf '%s\n' "$DPTP_VER" "$CP_VER" | sort -V | head -n1)" == "$DPTP_VER" ]; then
+              OCP_VER="${DPTP_VER}"
+          else
+              OCP_VER="${CP_VER}"
+          fi
+
+          preflight-trigger artifacts \
+          --environment "$(params.preflight_trigger_environment)" \
+          --ocp-version "${OCP_VER}"
+
+          preflight-trigger decrypt \
+          --gpg-decryption-private-key "${PIPELINE_GPG_DECRYPTION_PRIVATE_KEY}" \
+          --gpg-decryption-public-key "${PIPELINE_GPG_DECRYPTION_PUBLIC_KEY}" \
+          --file preflight.tar.gz.asc \
+          --output-path preflight.tar.gz
+
+          preflight-trigger artifacts --untar
+
+          mv artifacts/results.json .
+          mv preflight.stdout artifacts/
+          mv preflight.stderr artifacts/
+
+          echo -n "$(workspaces.results.path)/preflight.log" | tee "$(results.log_output_file.path)"
+          echo -n "$(workspaces.results.path)/results.json" | tee "$(results.result_output_file.path)"
+          echo -n "$(workspaces.results.path)/artifacts" | tee "$(results.artifacts_output_dir.path)"
+      workingDir: $(workspaces.results.path)
+  workspaces:
+    - name: results
+    - name: credentials

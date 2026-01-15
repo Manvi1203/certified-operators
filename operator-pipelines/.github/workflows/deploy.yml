@@ -1,0 +1,185 @@
+---
+name: Deployment
+
+on:  # yamllint disable-line rule:truthy
+  workflow_run:
+    workflows:
+      - Build and test
+    branches:
+      - main
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  prepare-env:
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.prepare.outputs.short_sha }}
+    steps:
+      - id: prepare
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    needs:
+      - prepare-env
+    environment:
+      name: dev
+    env:
+      SHORT_SHA: ${{needs.prepare-env.outputs.short_sha}}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          # Install python packages needed from ansible
+          pipx inject ansible-core jmespath openshift pygithub
+      - name: Deploy dev environment
+        uses: dawidd6/action-ansible-playbook@v5
+        with:
+          playbook: playbooks/deploy.yml
+          directory: ./ansible
+          requirements: playbooks/requirements.yml
+          vault_password: ${{secrets.VAULT_PASSWORD}}
+          options: |
+            --extra-vars "operator_pipeline_image_tag=${{ github.sha }}"
+            --extra-vars "suffix=${{needs.prepare-env.outputs.short_sha}}"
+            --extra-vars "env=dev"
+            --extra-vars "ansible_python_interpreter=/opt/pipx/venvs/ansible-core/bin/python3"
+            --skip-tags ci,import-index-images
+            --verbose
+
+  deploy-qa:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    needs:
+      - prepare-env
+    environment:
+      name: qa
+    env:
+      SHORT_SHA: ${{needs.prepare-env.outputs.short_sha}}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          # Install python packages needed from ansible
+          pipx inject ansible-core jmespath openshift pygithub
+      - name: Deploy qa environment
+        uses: dawidd6/action-ansible-playbook@v5
+        with:
+          playbook: playbooks/deploy.yml
+          directory: ./ansible
+          requirements: playbooks/requirements.yml
+          vault_password: ${{secrets.VAULT_PASSWORD}}
+          options: |
+            --extra-vars "operator_pipeline_image_tag=${{ github.sha }}"
+            --extra-vars "suffix=${{needs.prepare-env.outputs.short_sha}}"
+            --extra-vars "env=qa"
+            --extra-vars "ansible_python_interpreter=/opt/pipx/venvs/ansible-core/bin/python3"
+            --skip-tags ci,import-index-images
+            --verbose
+
+  deploy-stage:
+    runs-on: ubuntu-latest
+    environment:
+      name: stage
+    env:
+      SHORT_SHA: ${{needs.prepare-env.outputs.short_sha}}
+    needs:
+      - prepare-env
+      - deploy-qa
+      - deploy-dev
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          # Install python packages needed from ansible
+          pipx inject ansible-core jmespath openshift pygithub
+      - name: Deploy stage environment
+        uses: dawidd6/action-ansible-playbook@v5
+        with:
+          playbook: playbooks/deploy.yml
+          directory: ./ansible
+          requirements: playbooks/requirements.yml
+          vault_password: ${{secrets.VAULT_PASSWORD}}
+          options: |
+            --extra-vars "operator_pipeline_image_tag=${{ github.sha }}"
+            --extra-vars "suffix=${{needs.prepare-env.outputs.short_sha}}"
+            --extra-vars "env=stage"
+            --extra-vars "ansible_python_interpreter=/opt/pipx/venvs/ansible-core/bin/python3"
+            --skip-tags ci,import-index-images
+            --verbose
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+    env:
+      SHORT_SHA: ${{needs.prepare-env.outputs.short_sha}}
+    needs:
+      - prepare-env
+      - deploy-stage
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          # Install python packages needed from ansible
+          pipx inject ansible-core jmespath openshift pygithub
+      - name: Deploy prod environment
+        uses: dawidd6/action-ansible-playbook@v5
+        with:
+          playbook: playbooks/deploy.yml
+          directory: ./ansible
+          requirements: playbooks/requirements.yml
+          vault_password: ${{secrets.VAULT_PASSWORD_PROD}}
+          options: |
+            --extra-vars "operator_pipeline_image_tag=${{ github.sha }}"
+            --extra-vars "suffix=${{needs.prepare-env.outputs.short_sha}}"
+            --extra-vars "env=prod"
+            --extra-vars "ansible_python_interpreter=/opt/pipx/venvs/ansible-core/bin/python3"
+            --skip-tags ci,import-index-images
+            --verbose
+
+  release:
+    name: Github release
+    runs-on: ubuntu-latest
+    permissions: write-all
+    needs:
+      - deploy-prod
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Bump version and push tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+
+      - name: Log in to Quay.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: quay.io
+
+      - name: Tag image with a release tag
+        run: |
+
+          podman pull quay.io/redhat-isv/operator-pipelines-images:${{ github.sha }}
+
+          podman tag quay.io/redhat-isv/operator-pipelines-images:${{ github.sha }} quay.io/redhat-isv/operator-pipelines-images:released
+          podman tag quay.io/redhat-isv/operator-pipelines-images:${{ github.sha }} quay.io/redhat-isv/operator-pipelines-images:${{ steps.tag_version.outputs.new_tag }}
+
+          podman push quay.io/redhat-isv/operator-pipelines-images:released
+          podman push quay.io/redhat-isv/operator-pipelines-images:${{ steps.tag_version.outputs.new_tag }}

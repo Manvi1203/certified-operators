@@ -1,0 +1,43 @@
+---
+env: prod
+ocp_host: https://api.pipelines-prod.ijdb.p1.openshiftapps.com:6443
+operator_pipeline_base_url: "apps.pipelines-prod.ijdb.p1.openshiftapps.com"
+
+branch: main
+operator_pipeline_webhook_secret: ../../vaults/prod/github-webhook-secret-prod.txt
+
+kerberos_keytab_isv: ../../vaults/prod/operatorpipelines.keytab
+kerberos_keytab_isv_pending: ../../vaults/prod/operatorpipelines-pending.keytab
+kerberos_keytab_community: ../../vaults/prod/community-operatorpipelines.keytab
+kerberos_keytab_community_pending: ../../vaults/prod/community-operatorpipelines-pending.keytab
+
+preflight_trigger_environment: prod
+
+operator_pipeline_release_namespace: redhat-isv-operators
+
+operator_pipeline_hydra_sso_token_url: https://auth.redhat.com/auth/realms/EmployeeIDP/protocol/openid-connect/token
+operator_pipeline_hydra_sso_client_id_local_path: ../../vaults/prod/hydra-sso-client-id
+operator_pipeline_hydra_sso_client_secret_local_path: ../../vaults/prod/hydra-sso-client-secret
+
+operator_pipeline_kubeconfig_prow_local_path: ../../vaults/prod/kubeconfig-prow
+operator_pipeline_github_bot_token: ../../vaults/prod/github-bot-token.txt
+
+operator_pipeline_bot_ssh_key_path: ../../vaults/prod/github-bot-ssh
+
+operator_pipeline_preflight_decryption_key_private_local_path: ../../vaults/prod/preflight-decryption-key-priv.gpg
+operator_pipeline_preflight_decryption_key_public_local_path: ../../vaults/prod/preflight-decryption-key-pub
+
+tekton_pruner_keep: 50
+
+# Settings for importing index imagestreams
+certified_operator_index: registry.redhat.io/redhat/certified-operator-index
+redhat_marketplace_index: registry.redhat.io/redhat/redhat-marketplace-index
+
+# Settings for the index image bootstrap signing pipeline
+index_img_bootstrap_signing_pipeline_registry_auth_path: ../../vaults/common/index-bootstrap-signing-pipeline.json
+
+
+# Webhook dispatcher
+operator_pipeline_certified_operators_repository_name: "redhat-openshift-ecosystem/certified-operators"
+operator_pipeline_marketplace_operators_repository_name: "redhat-openshift-ecosystem/redhat-marketplace-operators"
+operator_pipeline_community_operators_repository_name: "redhat-openshift-ecosystem/community-operators-prod"
