@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    alloydbomni.internal.dbadmin.goog/task-type: monitoring
+    app.kubernetes.io/managed-by: olm
+    control-plane: controller-manager
+  name: local-controller-manager-metrics-service
+spec:
+  ports:
+  - name: metricsalloydbomni
+    port: 8080
+    protocol: TCP
+    targetPort: metrics
+  selector:
+    app.kubernetes.io/managed-by: olm
+    local-control-plane: controller-manager
+status:
+  loadBalancer: {}
